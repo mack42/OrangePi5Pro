@@ -4,6 +4,10 @@ A working recipe to build and run **Ubuntu 26.04 LTS (Resolute Raccoon)** on the
 
 As of May 2026 there is no off-the-shelf 26.04 image for this board. [Joshua Riek's `ubuntu-rockchip`](https://github.com/Joshua-Riek/ubuntu-rockchip) was archived on 29 April 2026, [Armbian's downloads page for the 5 Pro](https://www.armbian.com/orange-pi-5-pro/) only ships Debian Trixie, and Orange Pi's official downloads top out at 24.04. So we build it ourselves.
 
+## Just want the image?
+
+Skip everything below and grab a prebuilt 26.04 image from the [v1.0.0 release page](https://github.com/mack42/OrangePi5Pro/releases/tag/v1.0.0) — flash it with [balenaEtcher](https://etcher.balena.io/) and you're done. SHA-256 is in the matching `.sha` file. Continue reading only if you want to rebuild it yourself or understand why it's needed.
+
 ## Why this is two builds plus a patch
 
 Ubuntu 26.04 ships **`rust-coreutils` (uutils)** as the default coreutils. The uutils binaries use `rustix`, which crashes during startup with:
