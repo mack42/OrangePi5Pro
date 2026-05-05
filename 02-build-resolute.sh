@@ -80,9 +80,14 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 # --- 1. KDE Plasma + GPU diagnostic tools ---
+# DO NOT pass --no-install-recommends here. kubuntu-desktop's recommends
+# include xwayland / xserver-xorg-core that KWin-Wayland and any X11 desktop
+# session need. Skipping recommends produced a half-broken image where SDDM
+# greeter shows but no user session can compositor anything (blank screen).
 apt-get update
-apt-get install -y --no-install-recommends \
+apt-get install -y \
     kubuntu-desktop konsole mesa-utils vulkan-tools \
+    xserver-xorg-core xwayland \
     git ca-certificates curl
 
 # kubuntu-desktop's postinst flips default target to graphical, which makes
@@ -133,18 +138,20 @@ PROF
 git clone --depth=1 https://github.com/mack42/OrangePi5Pro.git /usr/local/share/OrangePi5Pro
 ln -sf /usr/local/share/OrangePi5Pro/03-setup.sh /usr/local/bin/orangepi-setup
 
-# Auto-run orangepi-setup on the first interactive login on a real TTY (not SSH).
-# Only runs once per user; sets a flag file under $HOME after success.
+# Auto-run orangepi-setup on the first interactive login on a real TTY (not
+# SSH). Set the flag file FIRST so the hook never re-prompts on subsequent
+# logins, even if the user Ctrl-C's mid-prompt or the script errors out. They
+# can always re-invoke manually with: orangepi-setup
 cat > /etc/profile.d/orangepi-firstrun.sh <<'PROF'
 #!/bin/sh
 # Auto-launch the OrangePi 5 Pro setup helper on first local TTY login.
 case "$(tty 2>/dev/null)" in
     /dev/tty[0-9]*)
         if [ "$(id -u)" -ne 0 ] && [ ! -e "$HOME/.opi5pro-setup-done" ]; then
-            echo "First-login setup helper launching — answer the prompts."
-            echo "Re-run later with: orangepi-setup"
+            touch "$HOME/.opi5pro-setup-done"
+            echo "First-login setup helper. Re-run later with: orangepi-setup"
             echo
-            /usr/local/bin/orangepi-setup && touch "$HOME/.opi5pro-setup-done"
+            /usr/local/bin/orangepi-setup || true
         fi
         ;;
 esac
