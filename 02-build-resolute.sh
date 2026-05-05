@@ -141,7 +141,7 @@ cat > /etc/profile.d/orangepi-firstrun.sh <<'PROF'
 case "$(tty 2>/dev/null)" in
     /dev/tty[0-9]*)
         if [ "$(id -u)" -ne 0 ] && [ ! -e "$HOME/.opi5pro-setup-done" ]; then
-            echo "First-login setup helper launching — answer the 5 prompts."
+            echo "First-login setup helper launching — answer the prompts."
             echo "Re-run later with: orangepi-setup"
             echo
             /usr/local/bin/orangepi-setup && touch "$HOME/.opi5pro-setup-done"
