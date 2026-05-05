@@ -136,12 +136,13 @@ cd OrangePi5Pro
 ./03-setup.sh
 ```
 
-`03-setup.sh` walks through four prompts and applies your answers:
+`03-setup.sh` walks through five prompts and applies your answers:
 
 1. **Install KDE Plasma desktop?** — skipped if already there. Adds ~2 GB.
 2. **Auto-start the UI on boot?** — toggles between `graphical.target` (boots into SDDM/Plasma) and `multi-user.target` (boots to text console).
 3. **Migrate root filesystem to NVMe?** — calls Armbian's `armbian-install` to copy the running rootfs onto an NVMe SSD if one's plugged in.
 4. **Put u-boot in SPI flash?** — only asked if (3) is yes. Choose YES for **pure-NVMe operation, no SD card needed after**. Choose NO to keep u-boot on the SD card and treat NVMe as just the rootfs.
+5. **Install hardware video decode?** — builds [`librockchip-mpp`](https://github.com/rockchip-linux/mpp) + [`woodyst/rockchip-vaapi`](https://github.com/woodyst/rockchip-vaapi) from source, drops a VA-API driver into `/usr/lib/aarch64-linux-gnu/dri/rockchip_drv_video.so` so Firefox / Brave / mpv can hardware-decode H.264 / HEVC / VP9 / AV1 via the RK3588 VPU. Takes 15-25 min on this hardware.
 
 Each step is independent — answer "no" to skip. The script is re-runnable: change your mind later, run it again.
 
@@ -173,7 +174,7 @@ This is the most important practical decision and it's why the recipe defaults t
 
 - The `02-build-resolute.sh` script defaults to a minimal CLI image. Pass `--desktop` for an image with KDE Plasma + SDDM baked in, or use the post-boot `03-setup.sh` to install Plasma after first boot — both reach the same end state.
 - Each system's Armbian build cache is independent. The first build on a fresh host pulls a ~2 GB Docker base image and clones a kernel tree (~1-2 GB). Subsequent builds reuse those.
-- HW video decode (`rkvdec` etc.) on mainline 6.18: the kernel exposes V4L2 nodes for H.264 / HEVC / VP9 / AV1 decoders, but the userspace stack (`librockchip-mpp`, patched ffmpeg, libva backend) **isn't packaged for resolute aarch64 yet**. Software decode works; hardware decode is a separate research effort. Tracked in [issue #1](https://github.com/mack42/OrangePi5Pro/issues/1).
+- HW video decode on mainline 6.18 isn't packaged for resolute aarch64 in apt, but the **`03-setup.sh` step 5** builds it from source: librockchip-mpp + woodyst/rockchip-vaapi land a working VA-API driver that exposes H.264 / HEVC / VP9 / AV1 hardware decode through libva, so Firefox / Brave / mpv can offload video playback to the RK3588 VPU. Verified with `vainfo`: the rockchip driver loads, all four codec families show up. See [issue #1](https://github.com/mack42/OrangePi5Pro/issues/1) for the full investigation.
 
 ## Troubleshooting
 
