@@ -9,6 +9,7 @@
 #   3. Migrate root filesystem to NVMe? (calls armbian-install)
 #   4. Put u-boot in SPI flash so the system boots without microSD?
 #   5. Install hardware video decode (rockchip-vaapi + librockchip-mpp)?
+#   6. Compensate for HDMI overscan (TV crops the text console)?
 #
 # Re-runnable. Each section is independent — answer "no" to any prompt to skip
 # that step.
@@ -190,7 +191,35 @@ PROF_EOF
     fi
 fi
 
+# ------------------------------------------------------------------------
+# 6. HDMI overscan compensation (TTY console)
+# ------------------------------------------------------------------------
+echo
+echo "[6/6] HDMI overscan compensation"
+echo "      Some TVs crop ~20px around the edges when receiving an HDMI signal."
+echo "      Plasma's KWin compensates automatically; the kernel TTY (boot console"
+echo "      / Ctrl+Alt+F2) does not, so text near edges gets cut off."
+echo
+echo "      The PROPER fix is on your TV: set HDMI input to 'Just Scan' / 'PC mode'"
+echo "      / 'Screen Fit' / '1:1' / 'Full Pixel' (name varies). That eliminates"
+echo "      cropping with no resolution loss."
+echo "      The WORKAROUND below adds a video= cmdline that forces the framebuffer"
+echo "      to 1880x1040 — fixes the cropping at the cost of ~80px of effective"
+echo "      resolution. Skip this if your TV / monitor doesn't have overscan."
+echo
+
+if grep -q "video=HDMI-A-1" /boot/armbianEnv.txt 2>/dev/null; then
+    echo "      Already applied — armbianEnv.txt has video=HDMI-A-1 in extraargs."
+else
+    ask "      Apply the overscan workaround (1880x1040 framebuffer) now?" n
+    if [[ "$ANSWER" == "y" ]]; then
+        sudo sed -i 's|^extraargs=\(.*\)$|extraargs=\1 video=HDMI-A-1:1880x1040@60|' /boot/armbianEnv.txt
+        echo "      → /boot/armbianEnv.txt extraargs updated. Reboot to apply."
+        echo "      → If 1880x1040 isn't right for your TV, edit the line manually."
+    fi
+fi
+
 echo
 echo "=== Setup complete ==="
-echo "If you changed the boot target, migrated to NVMe, or installed HW video decode,"
-echo "reboot now: sudo reboot"
+echo "If you changed the boot target, migrated to NVMe, installed HW video decode,"
+echo "or changed the framebuffer mode, reboot now: sudo reboot"
