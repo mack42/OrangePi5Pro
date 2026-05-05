@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
-# Build Armbian Ubuntu 26.04 (resolute) for Orange Pi 5 Pro using the vendor
-# kernel. Run this AFTER booting the 24.04 image produced by 01-build-noble.sh,
-# NOT directly on stock Orange Pi vendor Ubuntu 22.04 — that kernel lacks
-# CONFIG_BINFMT_MISC and Armbian's qemu-shielding cannot engage.
+# Build Armbian Ubuntu 26.04 (resolute) for Orange Pi 5 Pro. Run this AFTER
+# booting the 24.04 image produced by 01-build-noble.sh, NOT directly on stock
+# Orange Pi vendor Ubuntu 22.04 — that kernel lacks CONFIG_BINFMT_MISC and the
+# rust-coreutils chroot panic workaround can't deploy qemu-user-static.
 #
-# Even on the 24.04 image's 6.1.115 vendor kernel, rust-coreutils still panics
-# inside chroot due to a rustix/auxv quirk in the BSP, so this script applies a
-# small patch (apply-uutils-shim.sh) that swaps uutils symlinks for a
+# Defaults to BRANCH=current (mainline 6.18+ kernel) for working GPU
+# acceleration via the panthor + Mesa panvk drivers. Set BRANCH=vendor in the
+# environment if you specifically need the Rockchip BSP (NPU access, vendor
+# MPP video accel) — the result will be Plasma-usable but software-rendered
+# only, since the BSP's built-in mali_kbase claims the GPU and prevents
+# panfrost/panthor from binding. See https://github.com/mack42/OrangePi5Pro/issues/1
+#
+# A small patch (apply-uutils-shim.sh) swaps rust-coreutils symlinks for a
 # qemu-user-static shim during the build and restores them before image
 # creation. The final image ships clean uutils.
 #
 # Output: ~/armbian-build/framework/output/images/Armbian-*_resolute_*.img.xz
 
 set -euo pipefail
+
+BRANCH="${BRANCH:-current}"
 
 config_file="/boot/config-$(uname -r)"
 if [[ -r "$config_file" ]] && grep -qE '^# CONFIG_BINFMT_MISC is not set' "$config_file"; then
@@ -41,7 +48,7 @@ cd framework
 
 exec ./compile.sh \
     BOARD=orangepi5pro \
-    BRANCH=vendor \
+    BRANCH="$BRANCH" \
     RELEASE=resolute \
     BUILD_MINIMAL=yes \
     BUILD_DESKTOP=no \
