@@ -63,17 +63,21 @@ FRAMEWORK_DIR="${WORK}/framework" "${script_dir}/apply-uutils-shim.sh"
 
 cd framework
 
-# Build args differ slightly for desktop vs minimal.
+# Build args differ for desktop vs minimal. Note: Armbian's framework doesn't
+# yet have resolute desktop environment configs (only bookworm / noble / jammy
+# do as of May 2026), so --desktop bakes the Plasma metapackage into a
+# minimal-style rootfs via EXTRA_PACKAGES_ROOTFS rather than going through
+# BUILD_DESKTOP=yes. End-state is the same; the build path differs.
 if [[ "$DESKTOP" == "yes" ]]; then
-    echo ">>> Building DESKTOP image (KDE Plasma + SDDM). Expect ~30-45 min and ~2 GB output."
+    echo ">>> Building image with KDE Plasma packages baked in. Expect ~30-45 min and ~2 GB output."
+    echo ">>> SDDM auto-start is not enabled by this build — run 03-setup.sh on the booted system to flip the default target to graphical."
     exec ./compile.sh \
         BOARD=orangepi5pro \
         BRANCH="$BRANCH" \
         RELEASE=resolute \
-        BUILD_DESKTOP=yes \
-        BUILD_MINIMAL=no \
-        DESKTOP_ENVIRONMENT=kde-plasma \
-        DESKTOP_APPGROUPS_SELECTED="" \
+        BUILD_MINIMAL=yes \
+        BUILD_DESKTOP=no \
+        EXTRA_PACKAGES_ROOTFS="kubuntu-desktop konsole mesa-utils vulkan-tools" \
         KERNEL_CONFIGURE=no \
         COMPRESS_OUTPUTIMAGE=sha,xz \
         EXPERT=yes
