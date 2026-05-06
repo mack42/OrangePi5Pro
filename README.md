@@ -18,10 +18,10 @@ Flash with [balenaEtcher](https://etcher.balena.io/) on any OS, or `xz -dc *.img
 | File | Purpose |
 |---|---|
 | `01-build-noble.sh` | Builds the 24.04 stepping-stone image. Run on the stock OPi vendor 22.04 system. |
-| `02-build-resolute.sh` | Builds the 26.04 image. Run on the booted noble system. `--desktop` flag bakes Plasma + HW video decode + auto-prompt hook. |
+| `02-build-resolute.sh` | Builds the 26.04 image. Run on the booted noble system. `--desktop` flag bakes Plasma + HW video decode + Orange Pi 5 Pro branding. |
 | `apply-uutils-shim.sh` | Patches Armbian's framework with: (1) deploy uutils→qemu-shim, (2) restore before image creation, (3) rk3588 boot-delay (`rootwait rootdelay=10`). Idempotent. Called automatically by `02-build-resolute.sh`. |
-| `customize-image.sh` | Runs inside the chroot during a `--desktop` build. Installs `kubuntu-desktop`, builds `librockchip-mpp` + `woodyst/rockchip-vaapi` + `libva-utils` from source, drops `/etc/profile.d/orangepi-firstrun.sh` for first-TTY auto-launch of setup. Copied into `framework/userpatches/` by `02-build-resolute.sh --desktop`. |
-| `03-setup.sh` | Post-boot helper. Six prompts: install Plasma / auto-start UI / migrate to NVMe / SPI bootloader / install HW video / fix HDMI overscan. Run as `orangepi-setup` from the desktop image (auto-launched on first login) or `./03-setup.sh` from a clone. Re-runnable. |
+| `customize-image.sh` | Runs inside the chroot during a `--desktop` build. Installs `kubuntu-desktop`, builds `librockchip-mpp` + `woodyst/rockchip-vaapi` + `libva-utils` from source, replaces the Armbian motd header with Orange Pi 5 Pro branding, and drops a setup-reminder motd. Copied into `framework/userpatches/` by `02-build-resolute.sh --desktop`. |
+| `03-setup.sh` | Post-boot helper. Six prompts: install Plasma / auto-start UI / migrate to NVMe / SPI bootloader / install HW video / fix HDMI overscan. Run as `orangepi-setup` from the desktop image, or `./03-setup.sh` from a clone. Re-runnable. |
 | `README.md` | This file. |
 
 ## Why this is two builds plus a patch
@@ -193,11 +193,17 @@ Same flashing procedure as **Step 2** (Linux / macOS / Windows commands above), 
 
 Both images land you at a **TTY login** (multi-user.target as default — important so `armbian-firstrun` can run cleanly). Set root password, create your user, set timezone/locale.
 
-After firstrun finishes, log in as the user you just created. The login banner (motd) shows a reminder telling you to run **`orangepi-setup`** to finish configuration:
+After firstrun finishes, log in as the user you just created. The login banner (motd) shows an Orange Pi 5 Pro header (replacing the default Armbian banner) followed by a reminder to run **`orangepi-setup`** to finish configuration:
 
 ```
+  Welcome to Orange Pi 5 Pro — Rockchip RK3588S
+
+  System    : Ubuntu 26.04 (Resolute Raccoon)
+  Kernel    : 6.18.x-current-rockchip64
+  ...
+
 +--------------------------------------------------------------------+
-|  Orange Pi 5 Pro — first-time setup not yet completed.             |
+|  First-time setup not yet completed.                               |
 |                                                                    |
 |  Run:    orangepi-setup                                            |
 |                                                                    |

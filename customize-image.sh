@@ -91,12 +91,55 @@ if [ -f /boot/armbianEnv.txt ]; then
     fi
 fi
 
-# --- 4. motd reminder until setup is done ---
+# --- 4. motd: replace Armbian banner with Orange Pi 5 Pro branding ---
+# Armbian ships /etc/update-motd.d/10-armbian-header which prints a big
+# "ARMBIAN" banner on login. Replace it with our own header so the system
+# identifies as "Orange Pi 5 Pro" instead. Keep the dynamic info Armbian
+# normally prints (kernel, IPs, load) by sourcing /etc/armbian-release for
+# the version line and reusing standard tools for the rest.
+mkdir -p /etc/update-motd.d
+cat > /etc/update-motd.d/10-armbian-header <<'HEADER'
+#!/bin/sh
+# Orange Pi 5 Pro branded motd header (overrides Armbian default).
+distro="Ubuntu 26.04 (Resolute Raccoon)"
+[ -r /etc/os-release ] && . /etc/os-release && distro="${PRETTY_NAME:-$distro}"
+kernel="$(uname -r)"
+host="$(hostname)"
+upt="$(uptime -p 2>/dev/null | sed 's/^up //')"
+ip4="$(hostname -I 2>/dev/null | awk '{print $1}')"
+
+cat <<EOF
+
+  ____                              ____  _   ____    ____
+ / __ \\ _ __ __ _ _ __   __ _  ___ |  _ \\(_) | ___|  |  _ \\ _ __ ___
+| |  | | '__/ _\` | '_ \\ / _\` |/ _ \\| |_) | | |___ \\  | |_) | '__/ _ \\
+| |__| | | | (_| | | | | (_| |  __/|  __/| |  ___) | |  __/| | | (_) |
+ \\____/|_|  \\__,_|_| |_|\\__, |\\___||_|   |_| |____/  |_|   |_|  \\___/
+                        |___/
+
+  Welcome to Orange Pi 5 Pro — Rockchip RK3588S
+
+  System    : ${distro}
+  Kernel    : ${kernel}
+  Hostname  : ${host}
+  IPv4      : ${ip4:-<not assigned>}
+  Uptime    : ${upt:-just booted}
+
+EOF
+HEADER
+chmod +x /etc/update-motd.d/10-armbian-header
+
+# Suppress Armbian's other branded motd fragments that re-introduce the
+# "Armbian" name (tips, sysinfo headers). Keep the dynamic ones (load,
+# updates) but drop any that print Armbian-specific copy.
+for f in /etc/update-motd.d/30-armbian-sysinfo /etc/update-motd.d/35-armbian-tips; do
+    [ -f "$f" ] && chmod -x "$f"
+done
+
+# --- 5. motd reminder until setup is done ---
 # Shows a banner on every login (text or SSH) reminding the user to run
 # orangepi-setup, suppressed once any user's home contains .opi5pro-setup-done
-# (which the profile.d hook touches on first launch, and which 03-setup.sh
-# can also touch explicitly on successful completion).
-mkdir -p /etc/update-motd.d
+# (which 03-setup.sh touches on successful completion).
 cat > /etc/update-motd.d/99-orangepi-setup <<'MOTD'
 #!/bin/sh
 # Suppress if any user's home has the setup-done flag.
@@ -104,9 +147,8 @@ for f in /home/*/.opi5pro-setup-done /root/.opi5pro-setup-done; do
     [ -f "$f" ] && exit 0
 done
 cat <<EOF
-
 +--------------------------------------------------------------------+
-|  Orange Pi 5 Pro — first-time setup not yet completed.             |
+|  First-time setup not yet completed.                               |
 |                                                                    |
 |  Run:    orangepi-setup                                            |
 |                                                                    |
