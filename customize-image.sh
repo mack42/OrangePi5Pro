@@ -72,13 +72,15 @@ PROF
 #   - 03-setup-gui.sh (kdialog) → /usr/local/bin/orangepi-setup-gui
 #     Auto-launches once on first Plasma login (most users).
 git clone --depth=1 https://github.com/mack42/OrangePi5Pro.git /usr/local/share/OrangePi5Pro
-ln -sf /usr/local/share/OrangePi5Pro/03-setup.sh     /usr/local/bin/orangepi-setup
-ln -sf /usr/local/share/OrangePi5Pro/03-setup-gui.sh /usr/local/bin/orangepi-setup-gui
+ln -sf /usr/local/share/OrangePi5Pro/03-setup.sh                  /usr/local/bin/orangepi-setup
+ln -sf /usr/local/share/OrangePi5Pro/03-setup-gui.sh              /usr/local/bin/orangepi-setup-gui
+ln -sf /usr/local/share/OrangePi5Pro/orangepi-setup-gui-autostart.sh /usr/local/bin/orangepi-setup-gui-autostart
 
-# Plasma autostart: fires once on first KDE login if ~/.opi5pro-setup-done
-# is missing. The wizard touches the flag on completion, so subsequent
-# logins are quiet. Manual re-runs go through the application launcher
-# entry below (which has no flag check).
+# Plasma autostart: the .desktop in /etc/xdg/autostart/ fires once per
+# user login. The autostart shim is the FIRST gate — it checks/touches
+# ~/.opi5pro-setup-done so the wizard auto-launches exactly once, even
+# if the user closes it mid-flow. Manual re-runs go through the
+# application launcher entry (no flag check, no auto-fire).
 mkdir -p /etc/xdg/autostart /usr/share/applications
 install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui.desktop \
     /etc/xdg/autostart/orangepi-setup-gui.desktop
