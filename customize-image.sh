@@ -105,5 +105,33 @@ if [ -f /boot/armbianEnv.txt ]; then
     fi
 fi
 
+# --- 4. motd reminder until setup is done ---
+# Shows a banner on every login (text or SSH) reminding the user to run
+# orangepi-setup, suppressed once any user's home contains .opi5pro-setup-done
+# (which the profile.d hook touches on first launch, and which 03-setup.sh
+# can also touch explicitly on successful completion).
+mkdir -p /etc/update-motd.d
+cat > /etc/update-motd.d/99-orangepi-setup <<'MOTD'
+#!/bin/sh
+# Suppress if any user's home has the setup-done flag.
+for f in /home/*/.opi5pro-setup-done /root/.opi5pro-setup-done; do
+    [ -f "$f" ] && exit 0
+done
+cat <<EOF
+
++--------------------------------------------------------------------+
+|  Orange Pi 5 Pro — first-time setup not yet completed.             |
+|                                                                    |
+|  Run:    orangepi-setup                                            |
+|                                                                    |
+|  Six prompts: Install/auto-start Plasma, migrate root to NVMe,     |
+|  put u-boot in SPI flash, install hardware video decode, and       |
+|  optionally compensate for HDMI overscan.                          |
++--------------------------------------------------------------------+
+
+EOF
+MOTD
+chmod +x /etc/update-motd.d/99-orangepi-setup
+
 apt-get clean
 exit 0
