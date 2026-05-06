@@ -17,7 +17,15 @@
 #    can hit "cannot mount root fs" on the first boot before the SD
 #    controller finishes settling.
 #
-# All three are idempotent. Override location with FRAMEWORK_DIR env var.
+# 4) QEMU-PKG-RENAME (host pkg list + chroot installs):
+#    Ubuntu 26.04 dropped the `qemu-user-static` package; the static binaries
+#    moved into `qemu-user`, with binfmt registration in `qemu-user-binfmt`.
+#    Armbian's framework still hardcodes `qemu-user-static`, which fails
+#    `apt-get install` with "Package has no installation candidate". Rewrite
+#    the package name to `qemu-user-binfmt` (which Depends: qemu-user, so we
+#    get the binaries too) in every spot the framework references it.
+#
+# All four are idempotent. Override location with FRAMEWORK_DIR env var.
 set -euo pipefail
 
 FRAMEWORK_DIR="${FRAMEWORK_DIR:-$HOME/armbian-build/framework}"
@@ -26,6 +34,11 @@ cd "$FRAMEWORK_DIR"
 deploy_target=lib/functions/rootfs/create-cache.sh
 restore_target=lib/functions/main/rootfs-image.sh
 bootdelay_target=lib/functions/rootfs/distro-agnostic.sh
+qemu_pkg_targets=(
+    lib/functions/host/prepare-host.sh
+    lib/functions/rootfs/create-cache.sh
+    lib/functions/rootfs/qemu-static.sh
+)
 
 deploy_needle='	create_sources_list_and_deploy_repo_key "image-early" "${RELEASE}" "${SDCARD}/"'
 restore_needle='	LOG_SECTION="undeploy_qemu_binary_from_chroot_image" do_with_logging undeploy_qemu_binary_from_chroot "${SDCARD}" "image"'
@@ -133,3 +146,25 @@ else
     mv "${bootdelay_target}.new" "$bootdelay_target"
     echo "boot-delay: patched"
 fi
+
+# --- 4) QEMU-PKG-RENAME ---
+# Rewrite hardcoded `qemu-user-static` package references to
+# `qemu-user-binfmt` (the Ubuntu 26.04 replacement that Depends: qemu-user,
+# so we still get the static aarch64 binary). Display strings and binary
+# paths (qemu-aarch64-static) are intentionally not touched. Idempotent:
+# uses word-boundary match and re-runs are no-ops once renamed.
+for f in "${qemu_pkg_targets[@]}"; do
+    if [[ ! -f "$f" ]]; then
+        echo "qemu-pkg: skipping missing $f"
+        continue
+    fi
+    # Only rewrite when the package name appears as a standalone token
+    # (preceded/followed by quote, space, or end-of-line) — leaves comments
+    # and display_alert strings alone.
+    if grep -qE '(^|[ "'"'"'])qemu-user-static([ "'"'"']|$)' "$f"; then
+        sed -i -E 's/(^|[ "'"'"'])qemu-user-static([ "'"'"']|$)/\1qemu-user-binfmt\2/g' "$f"
+        echo "qemu-pkg: patched $f"
+    else
+        echo "qemu-pkg: $f already clean"
+    fi
+done
