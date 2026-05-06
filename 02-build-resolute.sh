@@ -49,6 +49,11 @@ if ! mountpoint -q /proc/sys/fs/binfmt_misc/; then
     sudo modprobe binfmt_misc || true
 fi
 
+# Resolve the directory containing this script *before* changing dir, so we
+# can find sibling files (apply-uutils-shim.sh, customize-image.sh) regardless
+# of how the script was invoked.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 WORK="${WORK:-$HOME/armbian-build}"
 mkdir -p "$WORK"
 cd "$WORK"
@@ -58,7 +63,6 @@ if [[ ! -d framework ]]; then
 fi
 
 # Apply the rust-coreutils chroot-panic workaround (idempotent).
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FRAMEWORK_DIR="${WORK}/framework" "${script_dir}/apply-uutils-shim.sh"
 
 # Note: Armbian's framework doesn't yet have resolute desktop environment
