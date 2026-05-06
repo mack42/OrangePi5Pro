@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Orange Pi 5 Pro Setup
+GenericName=First-time setup wizard
+Comment=Plasma autostart toggle, NVMe migration, HDMI overscan workaround
+Exec=sh -c '[ -e "$HOME/.opi5pro-setup-done" ] || /usr/local/bin/orangepi-setup-gui'
+Icon=preferences-system
+Terminal=false
+Categories=Settings;System;
+X-KDE-autostart-after=panel
+X-KDE-autostart-phase=2
+OnlyShowIn=KDE;

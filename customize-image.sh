@@ -65,23 +65,25 @@ cat > /etc/profile.d/rockchip-vaapi.sh <<'PROF'
 export LIBVA_DRIVER_NAME=rockchip
 PROF
 
-# --- 3. Bake in OrangePi5Pro repo + first-TTY-login auto-run hook ---
+# --- 3. Bake in OrangePi5Pro repo + Plasma kdialog setup wizard ---
+# Two front-ends share the same six-prompt setup flow:
+#   - 03-setup.sh (TTY) → /usr/local/bin/orangepi-setup
+#     For SSH / minimal-image / power-user re-runs.
+#   - 03-setup-gui.sh (kdialog) → /usr/local/bin/orangepi-setup-gui
+#     Auto-launches once on first Plasma login (most users).
 git clone --depth=1 https://github.com/mack42/OrangePi5Pro.git /usr/local/share/OrangePi5Pro
-ln -sf /usr/local/share/OrangePi5Pro/03-setup.sh /usr/local/bin/orangepi-setup
+ln -sf /usr/local/share/OrangePi5Pro/03-setup.sh     /usr/local/bin/orangepi-setup
+ln -sf /usr/local/share/OrangePi5Pro/03-setup-gui.sh /usr/local/bin/orangepi-setup-gui
 
-# Auto-run orangepi-setup on the first interactive login on a real TTY (not
-# SSH). Set the flag file FIRST so the hook never re-prompts on subsequent
-# logins, even if the user Ctrl-C's mid-prompt or the script errors out.
-# Re-invoke manually any time with: orangepi-setup
-# NOTE: We deliberately do NOT auto-launch orangepi-setup on first login
-# anymore. Earlier auto-launch versions ran the prompts in the gap between
-# armbian-firstrun finishing and the shell becoming interactive — which
-# coincided with the monitor going into DPMS blanking, leaving the user
-# staring at a "_" cursor on a black screen. Confusing and easy to assume
-# the system hung. Instead: motd (below) reminds the user every login
-# until setup is done, and they invoke 'orangepi-setup' themselves at a
-# clean shell prompt. 03-setup.sh disables blanking at its start so the
-# prompts stay visible throughout.
+# Plasma autostart: fires once on first KDE login if ~/.opi5pro-setup-done
+# is missing. The wizard touches the flag on completion, so subsequent
+# logins are quiet. Manual re-runs go through the application launcher
+# entry below (which has no flag check).
+mkdir -p /etc/xdg/autostart /usr/share/applications
+install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui.desktop \
+    /etc/xdg/autostart/orangepi-setup-gui.desktop
+install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui-launcher.desktop \
+    /usr/share/applications/orangepi-setup-gui.desktop
 
 # Belt-and-suspenders: also disable console blanking globally so even non-hook
 # TTYs don't power-save during long-running operations.

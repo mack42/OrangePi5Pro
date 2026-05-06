@@ -19,9 +19,12 @@ Flash with [balenaEtcher](https://etcher.balena.io/) on any OS, or `xz -dc *.img
 |---|---|
 | `01-build-noble.sh` | Builds the 24.04 stepping-stone image. Run on the stock OPi vendor 22.04 system. |
 | `02-build-resolute.sh` | Builds the 26.04 image. Run on the booted noble system. `--desktop` flag bakes Plasma + HW video decode + Orange Pi 5 Pro branding. |
-| `apply-uutils-shim.sh` | Patches Armbian's framework with: (1) deploy uutils→qemu-shim, (2) restore before image creation, (3) rk3588 boot-delay (`rootwait rootdelay=10`). Idempotent. Called automatically by `02-build-resolute.sh`. |
-| `customize-image.sh` | Runs inside the chroot during a `--desktop` build. Installs `kubuntu-desktop`, builds `librockchip-mpp` + `woodyst/rockchip-vaapi` + `libva-utils` from source, replaces the Armbian motd header with Orange Pi 5 Pro branding, and drops a setup-reminder motd. Copied into `framework/userpatches/` by `02-build-resolute.sh --desktop`. |
-| `03-setup.sh` | Post-boot helper. Six prompts: install Plasma / auto-start UI / migrate to NVMe / SPI bootloader / install HW video / fix HDMI overscan. Run as `orangepi-setup` from the desktop image, or `./03-setup.sh` from a clone. Re-runnable. |
+| `apply-uutils-shim.sh` | Patches Armbian's framework with: (1) deploy uutils→qemu-shim, (2) restore before image creation, (3) rk3588 boot-delay (`rootwait rootdelay=10`), (4) rewrite hardcoded `qemu-user-static` package name to `qemu-user-binfmt` for Ubuntu 26.04 hosts. Idempotent. Called automatically by `02-build-resolute.sh`. |
+| `customize-image.sh` | Runs inside the chroot during a `--desktop` build. Installs `kubuntu-desktop`, builds `librockchip-mpp` + `woodyst/rockchip-vaapi` + `libva-utils` from source, replaces the Armbian motd header with Orange Pi 5 Pro branding, drops a setup-reminder motd, and installs the kdialog wizard autostart entry. Copied into `framework/userpatches/` by `02-build-resolute.sh --desktop`. |
+| `03-setup.sh` | TTY post-boot helper. Six prompts: install Plasma / auto-start UI / migrate to NVMe / SPI bootloader / install HW video / fix HDMI overscan. Run as `orangepi-setup` from either image, or `./03-setup.sh` from a clone. Re-runnable. |
+| `03-setup-gui.sh` | KDE/kdialog wrapper around the same flow for the desktop image. Auto-launches once on first Plasma login (Plasma + HW video are baked in, so it's a 3-question wizard: autostart toggle, NVMe migration, HDMI overscan). Run as `orangepi-setup-gui` from the application launcher or terminal. |
+| `orangepi-setup-gui.desktop` | Plasma autostart entry. Shipped to `/etc/xdg/autostart/` on the desktop image; runs `orangepi-setup-gui` once on first KDE login if `~/.opi5pro-setup-done` is missing. |
+| `orangepi-setup-gui-launcher.desktop` | Application launcher entry. Shipped to `/usr/share/applications/` on the desktop image so the wizard is re-launchable from the menu without the flag check. |
 | `README.md` | This file. |
 
 ## Why this is two builds plus a patch
@@ -189,19 +192,28 @@ sudo umount /mnt && sudo losetup -d "$LOOP"
 
 Same flashing procedure as **Step 2** (Linux / macOS / Windows commands above), just point at the resolute `.img.xz`. **balenaEtcher** on Windows; `xz -dc | sudo dd ...` on Linux / macOS Terminal.
 
-## Step 5 — Post-boot setup (run `orangepi-setup`)
+## Step 5 — Post-boot setup
 
-Both images land you at a **TTY login** (multi-user.target as default — important so `armbian-firstrun` can run cleanly). Set root password, create your user, set timezone/locale.
+Both images land you at a **TTY login** for `armbian-firstrun` (set root password, create your user, set timezone/locale).
 
-After firstrun finishes, log in as the user you just created. The login banner (motd) shows an Orange Pi 5 Pro header (replacing the default Armbian banner) followed by a reminder to run **`orangepi-setup`** to finish configuration:
+### Desktop image — Plasma kdialog wizard
+
+After firstrun and reboot, the desktop image boots straight into SDDM. Log in to Plasma; a **kdialog setup wizard** auto-launches:
+
+- Auto-start Plasma on every boot (`graphical.target` vs `multi-user.target`)
+- Migrate root filesystem to NVMe — opens a terminal running `armbian-install`
+- Put u-boot in SPI flash (asked only if NVMe migration is yes)
+- HDMI overscan workaround (skip if your monitor maps pixels 1:1)
+
+The wizard touches `~/.opi5pro-setup-done` on completion so it doesn't pop up again. Re-run any time from the application launcher (**"Orange Pi 5 Pro Setup"**) or by running `orangepi-setup-gui` in a terminal. Plasma + HW video decode are baked into the image, so those prompts are skipped.
+
+You can also run the TTY version (`orangepi-setup`) over SSH or from the text console — both write to the same flag file.
+
+### Minimal image — TTY `orangepi-setup`
+
+After firstrun, log in at the text console. The motd shows an Orange Pi 5 Pro reminder:
 
 ```
-  Welcome to Orange Pi 5 Pro — Rockchip RK3588S
-
-  System    : Ubuntu 26.04 (Resolute Raccoon)
-  Kernel    : 6.18.x-current-rockchip64
-  ...
-
 +--------------------------------------------------------------------+
 |  First-time setup not yet completed.                               |
 |                                                                    |
@@ -213,9 +225,9 @@ After firstrun finishes, log in as the user you just created. The login banner (
 +--------------------------------------------------------------------+
 ```
 
-Type `orangepi-setup` and answer the prompts. The reminder banner suppresses itself once setup completes (touches `~/.opi5pro-setup-done`).
+Type `orangepi-setup` and answer the prompts. The minimal image has the script pre-installed at `/usr/local/share/OrangePi5Pro/`.
 
-For the minimal image (which doesn't pre-bake `orangepi-setup`), do it manually:
+If for any reason the script isn't on the image, you can clone and run it manually:
 
 ```bash
 git clone https://github.com/mack42/OrangePi5Pro.git
