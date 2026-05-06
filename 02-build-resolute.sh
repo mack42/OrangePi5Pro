@@ -77,17 +77,20 @@ if [[ "$DESKTOP" == "yes" ]]; then
     echo ">>> Building image with KDE Plasma + HW video decode (MPP+rockchip-vaapi) baked in."
     echo ">>> Expect ~45-60 min and ~2 GB output."
     echo ">>> First boot lands at TTY: armbian-firstrun runs (set root password, create user),"
-    echo ">>> then orangepi-setup auto-prompts for Plasma autostart / NVMe / etc."
-    if [[ ! -f "${script_dir}/customize-image.sh" ]]; then
-        echo "ERROR: ${script_dir}/customize-image.sh not found in repo." >&2
-        exit 1
-    fi
-    cp "${script_dir}/customize-image.sh" "$userpatches/customize-image.sh"
-    chmod +x "$userpatches/customize-image.sh"
+    echo ">>> then the kdialog wizard auto-launches in Plasma for NVMe / overscan / etc."
+    src="${script_dir}/customize-image.sh"
 else
     echo ">>> Building MINIMAL image (CLI). Expect ~8-15 min and ~300 MB output."
-    rm -f "$userpatches/customize-image.sh"
+    echo ">>> First boot lands at TTY: armbian-firstrun runs, then motd reminds the user"
+    echo ">>> to run 'orangepi-setup' for the post-boot wizard."
+    src="${script_dir}/customize-image-minimal.sh"
 fi
+if [[ ! -f "$src" ]]; then
+    echo "ERROR: $src not found in repo." >&2
+    exit 1
+fi
+cp "$src" "$userpatches/customize-image.sh"
+chmod +x "$userpatches/customize-image.sh"
 
 cd "${WORK}/framework"
 exec ./compile.sh \
