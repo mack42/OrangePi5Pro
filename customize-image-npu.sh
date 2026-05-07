@@ -34,15 +34,22 @@ set -e
 apt-get install -y --no-install-recommends \
     dkms build-essential device-tree-compiler
 
-# Find the linux-image-* package installed in the chroot and install its
-# matching headers package. Armbian names them linux-{image,headers}-
-# {branch}-{family}, e.g. linux-image-current-rockchip64. uname -r in a
-# chroot doesn't reflect the target kernel — use dpkg-query instead.
-kpkg="$(dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null | grep -vE 'dbg|tools' | head -1)"
+# Find the actual Armbian kernel package installed in the chroot and
+# install its matching headers package. Armbian uses
+# linux-{image,headers}-{branch}-{family} where branch ∈ {current, edge,
+# legacy, vendor} and family is rockchip64 here. There's also a
+# linux-image-armbian meta-package that's installed alongside but has no
+# corresponding linux-headers-armbian — match the real package, not the
+# meta. uname -r in a chroot doesn't reflect the target kernel either.
+kpkg="$(dpkg-query -W -f='${Package}\n' 2>/dev/null \
+    | grep -E '^linux-image-(current|edge|legacy|vendor)-rockchip64$' \
+    | head -1)"
 if [ -n "$kpkg" ]; then
     hpkg="${kpkg/linux-image-/linux-headers-}"
     apt-get install -y --no-install-recommends "$hpkg" \
         || echo "WARN: failed to install $hpkg — DKMS build will likely fail."
+else
+    echo "WARN: could not find linux-image-{current,edge,legacy,vendor}-rockchip64 — skipping headers install."
 fi
 
 # --- 2. DKMS rknpu module ---
