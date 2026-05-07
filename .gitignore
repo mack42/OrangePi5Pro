@@ -1,0 +1,5 @@
+*.img
+*.img.xz
+*.img.xz.sha
+*.log
+build/
