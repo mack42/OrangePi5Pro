@@ -175,7 +175,13 @@ OVERLAY
 
 # Compile the overlay against the running chroot's kernel headers.
 # Output to Armbian's standard overlay dir.
-overlay_dir=/boot/dtb/rockchip/overlay
+# Armbian's u-boot boot.cmd loads `overlays=` (kernel-provided) from
+# /boot/dtb/rockchip/overlay/, but `user_overlays=` (us) from
+# /boot/overlay-user/. Wrong path = u-boot silently skips the overlay
+# and the rknpu driver can't bind because the DT compatible never
+# changes from the upstream rockchip,rk3588-rknn-core to the vendor
+# rockchip,rk3588-rknpu we declare.
+overlay_dir=/boot/overlay-user
 mkdir -p "$overlay_dir"
 
 # Need to preprocess for the #include / dt-bindings — use cpp + dtc.
