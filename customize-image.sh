@@ -89,7 +89,11 @@ install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui-launcher.deskto
 
 # --- 3a. RK3588 NPU stack (DKMS rknpu + librknnrt + DT overlay) ---
 # Shared with the minimal image. See customize-image-npu.sh for the why.
-bash /usr/local/share/OrangePi5Pro/customize-image-npu.sh
+# Tolerate failure: NPU is "nice to have" — a DKMS compile error or a
+# missing dt-binding shouldn't abort the entire image build. Failure
+# leaves the image without NPU support but otherwise functional.
+bash /usr/local/share/OrangePi5Pro/customize-image-npu.sh || \
+    echo "WARN: NPU stack install failed — image will boot without NPU support."
 
 # --- 3b. Default to graphical.target after armbian-firstlogin ---
 # The image has to ship with default.target = multi-user.target so the
