@@ -75,6 +75,15 @@ mkdir -p /usr/src/rknpu-0.9.8
 cp -r /tmp/rknpu-module/. /usr/src/rknpu-0.9.8/
 rm -rf /tmp/rknpu-module
 
+# Patch rknpu_gem.c: rknpu_gem_sync_ioctl uses rknpu_dev->fake_dev
+# unconditionally, but the field is only declared under
+# CONFIG_ROCKCHIP_RKNPU_DRM_GEM. In our DMA_HEAP build this function is
+# dead code (it's a DRM ioctl handler, never reached when no DRM device
+# exists), but the compiler still type-checks it. Swap the references
+# to rknpu_dev->dev (which always exists) so the file compiles. This
+# is a known upstream w568w gap that Talos patches similarly.
+sed -i 's/rknpu_dev->fake_dev/rknpu_dev->dev/g' /usr/src/rknpu-0.9.8/src/rknpu_gem.c
+
 # Patch Kbuild to (a) drop rknpu_devfreq.o and (b) define
 # RKNPU_NO_DEVFREQ globally. Armbian-current's kernel headers don't
 # install linux/devfreq-governor.h (CONFIG_PM_DEVFREQ may be enabled
