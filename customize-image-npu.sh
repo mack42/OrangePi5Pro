@@ -92,14 +92,75 @@ echo '# Force devfreq-stub path (no devfreq-governor.h in Armbian-current)' \
     >> /usr/src/rknpu-0.9.8/Kbuild
 echo 'ccflags-y += -DRKNPU_NO_DEVFREQ' >> /usr/src/rknpu-0.9.8/Kbuild
 
-# Disable the DRM_GEM register path so the driver registers as a misc
-# device exposing /dev/rknpu — that's what librknnrt.so 2.3.2 opens.
-# Without this the driver registers as a DRM accel device only (visible
-# under /sys/class/drm/) and librknnrt fails to find /dev/rknpu.
-# Talos uses an equivalent #undef in a force-include compat header; we
-# pass -U on the command line which has the same effect (and overrides
-# the upstream Kbuild's earlier -DCONFIG_ROCKCHIP_RKNPU_DRM_GEM).
-echo 'ccflags-y += -UCONFIG_ROCKCHIP_RKNPU_DRM_GEM' >> /usr/src/rknpu-0.9.8/Kbuild
+# Switch the driver from DRM_GEM mode to DMA_HEAP mode so it registers
+# as a misc device at /dev/rknpu — that's what librknnrt.so 2.3.2 opens.
+# In DRM_GEM mode the driver instead creates only /dev/dri/renderD* /
+# /dev/dri/card*, which librknnrt can't talk to.
+#
+# These two macros are *mutually exclusive* — rknpu_submit_ioctl has
+# incompatible signatures under each — so the right move is to:
+#   1. Strip upstream's -DCONFIG_ROCKCHIP_RKNPU_DRM_GEM from Kbuild
+#   2. Add  -DCONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+#   3. Force-include a header that #undefs DRM_GEM after autoconf.h has
+#      run (a bare -U in ccflags is processed before -include linux/
+#      kconfig.h and gets overridden if the kernel config happens to
+#      have the same symbol — belt-and-suspenders).
+#   4. Drop a stub for linux/rk-dma-heap.h — Rockchip BSP-only header
+#      not present in mainline; without it the DMA_HEAP code path
+#      fails to compile. Stub returns sane "unavailable" values; heap
+#      allocation degrades gracefully at runtime.
+# All of this matches the production stack in schwankner/talos-rk3588-npu.
+
+sed -i '/^ccflags-y += -DCONFIG_ROCKCHIP_RKNPU_DRM_GEM$/d' /usr/src/rknpu-0.9.8/Kbuild
+echo 'ccflags-y += -DCONFIG_ROCKCHIP_RKNPU_DMA_HEAP' >> /usr/src/rknpu-0.9.8/Kbuild
+
+# Force-include header — undef DRM_GEM after autoconf.h.
+mkdir -p /usr/src/rknpu-0.9.8/src/include/compat/linux
+cat > /usr/src/rknpu-0.9.8/src/include/compat/rknpu_build_config.h <<'CFGHDR'
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Force-included via ccflags-y to override autoconf.h-set DRM_GEM. */
+#ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
+#undef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
+#endif
+#ifndef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+#define CONFIG_ROCKCHIP_RKNPU_DMA_HEAP 1
+#endif
+CFGHDR
+echo 'ccflags-y += -include $(src)/src/include/compat/rknpu_build_config.h' \
+    >> /usr/src/rknpu-0.9.8/Kbuild
+
+# rk-dma-heap.h compat stub — Rockchip BSP API, absent from mainline.
+# All functions return safe "unavailable" sentinels so the DMA_HEAP path
+# compiles and degrades to "no heap" at runtime. /dev/rknpu is still
+# created via misc_register regardless of heap availability.
+cat > /usr/src/rknpu-0.9.8/src/include/compat/linux/rk-dma-heap.h <<'DMAHDR'
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _LINUX_RK_DMA_HEAP_H
+#define _LINUX_RK_DMA_HEAP_H
+#include <linux/dma-buf.h>
+#include <linux/device.h>
+#include <linux/errno.h>
+#include <linux/err.h>
+struct rk_dma_heap;
+static inline struct rk_dma_heap *rk_dma_heap_find(const char *name) { return NULL; }
+static inline int rk_dma_heap_set_dev(struct device *heap_dev) { return -ENODEV; }
+static inline struct dma_buf *
+rk_dma_heap_buffer_alloc(struct rk_dma_heap *heap, size_t len,
+                         unsigned int fd_flags, unsigned int heap_flags,
+                         const char *name) { return ERR_PTR(-ENODEV); }
+static inline void rk_dma_heap_buffer_free(struct dma_buf *dmabuf) {}
+static inline int
+rk_dma_heap_bufferfd_alloc(struct rk_dma_heap *heap, size_t len,
+                           unsigned int fd_flags, unsigned int heap_flags,
+                           const char *name) { return -ENODEV; }
+static inline int
+rk_dma_heap_alloc_contig_pages(struct rk_dma_heap *heap, size_t len,
+                               unsigned int heap_flags, struct page **pages) { return -ENODEV; }
+static inline void
+rk_dma_heap_free_contig_pages(struct page **pages, size_t len) {}
+static inline int rk_dma_heap_cma_setup(void) { return 0; }
+#endif /* _LINUX_RK_DMA_HEAP_H */
+DMAHDR
 
 dkms add rknpu/0.9.8
 
