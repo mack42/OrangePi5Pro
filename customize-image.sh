@@ -87,6 +87,10 @@ install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui.desktop \
 install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui-launcher.desktop \
     /usr/share/applications/orangepi-setup-gui.desktop
 
+# --- 3a. RK3588 NPU stack (DKMS rknpu + librknnrt + DT overlay) ---
+# Shared with the minimal image. See customize-image-npu.sh for the why.
+bash /usr/local/share/OrangePi5Pro/customize-image-npu.sh
+
 # --- 3b. Default to graphical.target after armbian-firstlogin ---
 # The image has to ship with default.target = multi-user.target so the
 # very first boot reaches a TTY where /etc/profile.d/armbian-check-first-

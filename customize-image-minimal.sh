@@ -24,6 +24,10 @@ apt-get install -y --no-install-recommends git ca-certificates
 git clone --depth=1 https://github.com/mack42/OrangePi5Pro.git /usr/local/share/OrangePi5Pro
 ln -sf /usr/local/share/OrangePi5Pro/03-setup.sh /usr/local/bin/orangepi-setup
 
+# --- 1a. RK3588 NPU stack (DKMS rknpu + librknnrt + DT overlay) ---
+# Shared with the desktop image. See customize-image-npu.sh for the why.
+bash /usr/local/share/OrangePi5Pro/customize-image-npu.sh
+
 # --- 2. Disable kernel console blanking globally ---
 # 03-setup.sh disables blanking via setterm at runtime, but TTY logins
 # *before* the script runs can still go dark on slow boots. Belt-and-
