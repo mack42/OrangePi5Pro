@@ -80,8 +80,16 @@ dkms add rknpu/0.9.8
 # practice that's exactly one (the freshly-baked image's kernel). The
 # loop tolerates per-kver build failures so a partial install (e.g. an
 # older kernel missing headers) doesn't abort the whole image build.
+# On build failure, dump make.log so the actual compile error is visible
+# in the build log (otherwise the chroot is destroyed and the diagnostic
+# is gone).
 for kver in $(ls /lib/modules 2>/dev/null); do
-    dkms build rknpu/0.9.8 -k "$kver"   || echo "WARN: dkms build failed for $kver"
+    if ! dkms build rknpu/0.9.8 -k "$kver"; then
+        echo "WARN: dkms build failed for $kver — full make.log:"
+        cat "/var/lib/dkms/rknpu/0.9.8/build/make.log" 2>/dev/null | tail -200 || true
+        echo "===== END make.log ====="
+        continue
+    fi
     dkms install rknpu/0.9.8 -k "$kver" || echo "WARN: dkms install failed for $kver"
 done
 
@@ -103,6 +111,8 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
 
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/power/rk3588-power.h>
+#include <dt-bindings/clock/rockchip,rk3588-cru.h>
+#include <dt-bindings/reset/rockchip,rk3588-cru.h>
 
 / {
     compatible = "rockchip,rk3588";
@@ -162,13 +172,20 @@ mkdir -p "$overlay_dir"
 # /usr/src/linux-headers-6.18.27-current-rockchip64. Glob and pick one.
 header_dir="$(ls -d /usr/src/linux-headers-* 2>/dev/null | head -1)"
 if [ -n "$header_dir" ] && [ -d "$header_dir/include" ]; then
-    cpp -nostdinc -undef -x assembler-with-cpp \
-        -I "$header_dir/include" \
-        -o /tmp/rk3588-rknpu-opi5pro.dts.preprocessed \
-        /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts
-    dtc -@ -I dts -O dtb \
-        -o "$overlay_dir/rk3588-rknpu-opi5pro.dtbo" \
-        /tmp/rk3588-rknpu-opi5pro.dts.preprocessed
+    # cpp+dtc failure must NOT take down the whole image build — wrap
+    # everything so a syntax error / missing dt-binding here just skips
+    # overlay install with a WARN.
+    if cpp -nostdinc -undef -x assembler-with-cpp \
+            -I "$header_dir/include" \
+            -o /tmp/rk3588-rknpu-opi5pro.dts.preprocessed \
+            /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts \
+        && dtc -@ -I dts -O dtb \
+            -o "$overlay_dir/rk3588-rknpu-opi5pro.dtbo" \
+            /tmp/rk3588-rknpu-opi5pro.dts.preprocessed; then
+        echo "DT overlay compiled: $overlay_dir/rk3588-rknpu-opi5pro.dtbo"
+    else
+        echo "WARN: DT overlay compile failed — NPU module will load but with no DT node to bind to."
+    fi
     rm -f /tmp/rk3588-rknpu-opi5pro.dts.preprocessed
 else
     echo "WARN: no kernel headers tree found at /usr/src/linux-headers-* — DT overlay not compiled."

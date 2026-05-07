@@ -26,7 +26,9 @@ ln -sf /usr/local/share/OrangePi5Pro/03-setup.sh /usr/local/bin/orangepi-setup
 
 # --- 1a. RK3588 NPU stack (DKMS rknpu + librknnrt + DT overlay) ---
 # Shared with the desktop image. See customize-image-npu.sh for the why.
-bash /usr/local/share/OrangePi5Pro/customize-image-npu.sh
+# Tolerate failure (NPU is "nice to have" — see customize-image.sh).
+bash /usr/local/share/OrangePi5Pro/customize-image-npu.sh || \
+    echo "WARN: NPU stack install failed — image will boot without NPU support."
 
 # --- 2. Disable kernel console blanking globally ---
 # 03-setup.sh disables blanking via setterm at runtime, but TTY logins
