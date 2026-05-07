@@ -93,6 +93,12 @@ cp "$src" "$userpatches/customize-image.sh"
 chmod +x "$userpatches/customize-image.sh"
 
 cd "${WORK}/framework"
+# INSTALL_HEADERS=yes — pre-installs the kernel-headers .deb into the
+# rootfs alongside linux-image-current-rockchip64. customize-image-npu.sh
+# needs the headers to (a) DKMS-build the rknpu module and (b) compile
+# the rk3588-rknpu DT overlay against dt-bindings/. Without this flag,
+# Armbian only installs the linux-image deb and customize-image runs
+# without headers available.
 exec ./compile.sh \
     BOARD=orangepi5pro \
     BRANCH="$BRANCH" \
@@ -100,5 +106,6 @@ exec ./compile.sh \
     BUILD_MINIMAL=yes \
     BUILD_DESKTOP=no \
     KERNEL_CONFIGURE=no \
+    INSTALL_HEADERS=yes \
     COMPRESS_OUTPUTIMAGE=sha,xz \
     EXPERT=yes

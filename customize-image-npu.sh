@@ -44,13 +44,30 @@ apt-get install -y --no-install-recommends \
 kpkg="$(dpkg-query -W -f='${Package}\n' 2>/dev/null \
     | grep -E '^linux-image-(current|edge|legacy|vendor)-rockchip64$' \
     | head -1)"
-if [ -n "$kpkg" ]; then
-    hpkg="${kpkg/linux-image-/linux-headers-}"
-    apt-get install -y --no-install-recommends "$hpkg" \
-        || echo "WARN: failed to install $hpkg — DKMS build will likely fail."
-else
-    echo "WARN: could not find linux-image-{current,edge,legacy,vendor}-rockchip64 — skipping headers install."
+if [ -z "$kpkg" ]; then
+    echo "WARN: could not find linux-image-{current,edge,legacy,vendor}-rockchip64 — skipping NPU install."
+    exit 0
 fi
+hpkg="${kpkg/linux-image-/linux-headers-}"
+
+# Headers should already be installed via INSTALL_HEADERS=yes in the
+# compile.sh invocation (see 02-build-resolute.sh). Verify, with
+# fallbacks: try apt-get (works if a local repo is configured), then
+# search the chroot for a sideloaded .deb.
+if ! dpkg-query -W -f='${Status}\n' "$hpkg" 2>/dev/null | grep -q '^install ok installed$'; then
+    if ! apt-get install -y --no-install-recommends "$hpkg" 2>/dev/null; then
+        hdeb="$(find / -xdev -maxdepth 6 -name "${hpkg}_*.deb" 2>/dev/null | head -1)"
+        if [ -n "$hdeb" ]; then
+            echo "Installing headers from local deb: $hdeb"
+            dpkg -i "$hdeb" || apt-get -f install -y --no-install-recommends || true
+        fi
+    fi
+fi
+if ! dpkg-query -W -f='${Status}\n' "$hpkg" 2>/dev/null | grep -q '^install ok installed$'; then
+    echo "WARN: $hpkg not installed — skipping NPU stack (DKMS would fail without headers)."
+    exit 0
+fi
+echo "Kernel headers ready: $hpkg"
 
 # --- 2. DKMS rknpu module ---
 git clone --depth=1 https://github.com/w568w/rknpu-module.git /tmp/rknpu-module
@@ -140,14 +157,11 @@ overlay_dir=/boot/dtb/rockchip/overlay
 mkdir -p "$overlay_dir"
 
 # Need to preprocess for the #include / dt-bindings — use cpp + dtc.
-header_dir=""
-if [ -n "$kpkg" ] && [ -d "/usr/src/$(echo "$kpkg" | sed 's/^linux-image-/linux-headers-/')" ]; then
-    header_dir="/usr/src/$(echo "$kpkg" | sed 's/^linux-image-/linux-headers-/')"
-elif ls -d /usr/src/linux-headers-* 2>/dev/null | head -1 >/dev/null; then
-    header_dir="$(ls -d /usr/src/linux-headers-* | head -1)"
-fi
-
-if [ -n "$header_dir" ]; then
+# Armbian's headers deb installs source/headers under
+# /usr/src/linux-headers-${KVER}-${BRANCH}-${FAMILY}, e.g.
+# /usr/src/linux-headers-6.18.27-current-rockchip64. Glob and pick one.
+header_dir="$(ls -d /usr/src/linux-headers-* 2>/dev/null | head -1)"
+if [ -n "$header_dir" ] && [ -d "$header_dir/include" ]; then
     cpp -nostdinc -undef -x assembler-with-cpp \
         -I "$header_dir/include" \
         -o /tmp/rk3588-rknpu-opi5pro.dts.preprocessed \
@@ -157,7 +171,7 @@ if [ -n "$header_dir" ]; then
         /tmp/rk3588-rknpu-opi5pro.dts.preprocessed
     rm -f /tmp/rk3588-rknpu-opi5pro.dts.preprocessed
 else
-    echo "WARN: no kernel headers found; skipping DT overlay compile."
+    echo "WARN: no kernel headers tree found at /usr/src/linux-headers-* — DT overlay not compiled."
 fi
 
 # --- 4. Enable the overlay in armbianEnv.txt ---
