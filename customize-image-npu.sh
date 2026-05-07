@@ -92,6 +92,15 @@ echo '# Force devfreq-stub path (no devfreq-governor.h in Armbian-current)' \
     >> /usr/src/rknpu-0.9.8/Kbuild
 echo 'ccflags-y += -DRKNPU_NO_DEVFREQ' >> /usr/src/rknpu-0.9.8/Kbuild
 
+# Disable the DRM_GEM register path so the driver registers as a misc
+# device exposing /dev/rknpu — that's what librknnrt.so 2.3.2 opens.
+# Without this the driver registers as a DRM accel device only (visible
+# under /sys/class/drm/) and librknnrt fails to find /dev/rknpu.
+# Talos uses an equivalent #undef in a force-include compat header; we
+# pass -U on the command line which has the same effect (and overrides
+# the upstream Kbuild's earlier -DCONFIG_ROCKCHIP_RKNPU_DRM_GEM).
+echo 'ccflags-y += -UCONFIG_ROCKCHIP_RKNPU_DRM_GEM' >> /usr/src/rknpu-0.9.8/Kbuild
+
 dkms add rknpu/0.9.8
 
 # Build/install for every kernel version present in /lib/modules. In
@@ -153,7 +162,9 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
         interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
                      <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
-        interrupt-names = "npu_irq0", "npu_irq1", "npu_irq2";
+        /* Names must match w568w/rknpu-module's of-property lookups
+         * (rknpu_drv.c — irqs[].name = "npu0_irq" for multi-core RK3588). */
+        interrupt-names = "npu0_irq", "npu1_irq", "npu2_irq";
 
         clocks = <&scmi_clk SCMI_CLK_NPU>;
         clock-names = "clk_npu";
@@ -161,7 +172,9 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
         power-domains = <&power RK3588_PD_NPUTOP>,
                         <&power RK3588_PD_NPU1>,
                         <&power RK3588_PD_NPU2>;
-        power-domain-names = "nputop", "npu1", "npu2";
+        /* Driver attaches per-core PM domains via dev_pm_domain_attach_by_name
+         * (rknpu_drv.c) using the strings "npu0"/"npu1"/"npu2". */
+        power-domain-names = "npu0", "npu1", "npu2";
 
         iommus = <&rknn_mmu_0>, <&rknn_mmu_1>, <&rknn_mmu_2>;
 
