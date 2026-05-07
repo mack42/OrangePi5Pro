@@ -28,6 +28,20 @@ apt-get install -y \
 
 systemctl set-default multi-user.target
 
+# --- 1b. Brave browser (chromium-based, native arm64 deb, VAAPI HW decode) ---
+# Add Brave's official APT repo and install. Ubuntu's snap-based Firefox
+# is sluggish on RK3588 hardware; Brave's deb is responsive and works
+# with the rockchip-vaapi we build in section 2 (browser flags needed
+# at first run — orangepi-setup-gui can be extended to set those later).
+install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
+curl -fsSL https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg \
+    -o /usr/share/keyrings/brave-browser-archive-keyring.gpg
+chmod 0644 /usr/share/keyrings/brave-browser-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg arch=arm64] https://brave-browser-apt-release.s3.brave.com/ stable main" \
+    > /etc/apt/sources.list.d/brave-browser-release.list
+apt-get update
+apt-get install -y brave-browser
+
 # --- 2. HW video decode stack (librockchip-mpp + rockchip-vaapi + libva-utils) ---
 apt-get install -y \
     build-essential cmake meson ninja-build pkg-config \
