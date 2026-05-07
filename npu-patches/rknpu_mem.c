@@ -1,0 +1,707 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * rknpu_mem.c — NPU memory allocation: small buffers via scatter-gather,
+ *               large buffers via direct iommu_map() at a manually-managed
+ *               IOVA cursor.
+ *
+ * Bug 47 (initial): rk_dma_heap_find("rk-dma-heap-cma") returns NULL on
+ * mainline 6.18 (Rockchip BSP CMA heap absent), and the Bug 36 fallback
+ * rk_dma_heap_find("system") also returns NULL because rknpu's internal
+ * heap registry does not include the standard system heap.  rknpu_dev->heap
+ * therefore remains NULL, causing the stub to return -ENOSYS for all memory
+ * ioctls.  librknnrt.so v2.3.x calls RKNPU_MEM_CREATE during init_runtime()
+ * to allocate small internal NPU command buffers.
+ *
+ * Bug 47 (fix, rev 2): The original rev 1 returned obj_addr = cpu_addr (the
+ * raw kernel virtual address of the DMA buffer).  The rknpu_job.c submit path
+ * casts task_obj_addr as (struct rknpu_mem_object *) and reads ->kv_addr to
+ * locate the task/command array.  With a raw cpu_addr as the struct pointer,
+ * the kernel read garbage bytes from the beginning of the NPU command data as
+ * if they were struct fields; the resulting garbage kv_addr was then used to
+ * program the NPU hardware, causing the job to silently time out (3 retries ×
+ * 60 s = 180 s) with no interrupt ever firing.
+ *
+ * Correct fix: embed a struct rknpu_mem_object (as defined in rknpu_mem.h)
+ * inside a larger tracking struct.  Fill kv_addr with the kernel virtual
+ * address returned by the allocator, and dma_addr with the device IOVA.
+ * Return the address of the embedded rknpu_mem_object as obj_addr so the
+ * submit path dereferences a valid, correctly-populated struct.
+ *
+ * Bug 55 (fix, rev 2): dma_alloc_noncontiguous() silently returns NULL on
+ * kernel 6.18.22 / Rockchip IOMMU for the rknpu device even with abundant
+ * free RAM.  Root cause: iommu_dma_ops.alloc_noncontiguous calls
+ * iommu_dma_alloc_pages() which uses dma_alloc_pages() internally; under the
+ * Rockchip IOMMU translated-mode domain for fdab0000.rknpu, iova_alloc()
+ * fails to find a contiguous 2.4 GB window in the device's IOVA space (the
+ * device DMA mask limits the IOVA range to 4 GB, and early boot allocations
+ * fragment it).
+ *
+ * Fix (rev 2): bypass dma_alloc_noncontiguous() entirely.  Allocate physical
+ * pages individually with alloc_page(GFP_KERNEL) — always succeeds given free
+ * RAM — then build an sg_table from those pages and call dma_map_sgtable() to
+ * obtain the IOVA mapping.  dma_map_sgtable() allocates individual 4 KB IOVA
+ * slots rather than one contiguous window, so the IOVA allocator's contiguous-
+ * range constraint does not apply.  vmap() provides the contiguous kernel
+ * virtual address (kv_addr) for rknpu_job.c.
+ *
+ * Bug 55 (fix, rev 3): dma_map_sgtable() returns -ENOMEM (-12) for the
+ * 2.4 GB model-weight buffer despite Rev 2's per-page allocation.  Root cause
+ * (two interacting problems):
+ *
+ *   1. sg_alloc_table_from_pages() coalesces physically-contiguous pages.
+ *      When alloc_page(GFP_KERNEL) is called 638,208 times on a freshly-booted
+ *      system, the buddy allocator hands out pages in large physically-
+ *      contiguous runs.  The resulting sg_table has nents=2 (two ~1.2 GB
+ *      chunks) rather than 638,208 individual 4 KB entries.
+ *
+ *   2. dma_map_sgtable() maps each sg entry to its OWN, independent IOVA
+ *      region.  For nents=2, the two regions are NOT adjacent in IOVA space.
+ *      The NPU hardware accesses model weights using base_iova + sequential
+ *      byte offsets; beyond the first sg entry it reads unmapped IOVA and the
+ *      IOMMU raises a fault.  Additionally, with the default 32-bit DMA mask
+ *      (4 GB IOVA), allocating a 1.2 GB contiguous IOVA window alongside other
+ *      active mappings fails with -ENOMEM.
+ *
+ * Fix (rev 3): two-step solution for large allocations (> RKNPU_MEM_LARGE_THR):
+ *
+ *   Step 1 — widen the DMA mask to 40-bit before the allocation.  This gives
+ *   the IOVA allocator a 1 TB address space; a 2.4 GB contiguous window is
+ *   trivially available.  The RK3588 SoC and its ARM SMMU-500 support 40-bit
+ *   IOVAs (the physical address space is 40-bit).
+ *
+ *   Step 2 — use dma_alloc_noncontiguous().  Unlike raw dma_map_sgtable(),
+ *   dma_alloc_noncontiguous() maps physically-scattered pages into a SINGLE
+ *   contiguous IOVA range through the IOMMU page table.  The NPU hardware sees
+ *   a flat [iova, iova + size) window regardless of physical layout.
+ *   dma_vmap_noncontiguous() provides the contiguous kernel virtual address
+ *   (kv_addr) for rknpu_job.c.
+ *
+ * Bug 55 (fix, rev 4): dma_alloc_noncontiguous() fails even after widening
+ * dma_mask to 40-bit.  Root cause: dma_alloc_noncontiguous() uses
+ * dev->coherent_dma_mask (not dma_mask) to compute the IOVA upper limit.
+ * Rev 3 called dma_set_mask() which only updates *dev->dma_mask, leaving
+ * coherent_dma_mask at 32-bit (0xffffffff).
+ *
+ * Fix (rev 4): call dma_set_mask_and_coherent() instead of dma_set_mask().
+ *
+ * Bug 55 (fix, rev 5): dma_alloc_noncontiguous() still fails even with both
+ * masks at 40-bit.  Root cause: the IOVA domain is not resized dynamically
+ * when the DMA mask is changed at runtime.  The IOVA domain (iova_domain
+ * inside the iommu_dma_cookie) is initialized on the FIRST DMA operation
+ * (iommu_dma_init_domain → init_iova_domain), with end_pfn derived from
+ * the DMA mask in effect AT THAT MOMENT.  Revs 3 and 4 widened the mask only
+ * in the large-buffer branch, which runs AFTER the small buffer allocations
+ * (19 MiB and 83 MiB).  Those small allocations happened first with a 32-bit
+ * mask, locking the IOVA domain to [0, 4 GB).  Widening the mask later has
+ * no effect because the domain is already initialized.
+ *
+ * Fix (rev 5): widen the DMA mask to 40-bit at the TOP of
+ * rknpu_mem_create_ioctl(), unconditionally, before any size check or DMA
+ * operation.  The first call now initialises the IOVA domain with a 40-bit
+ * limit.
+ *
+ * Bug 55 (fix, rev 6): dma_alloc_noncontiguous() STILL fails despite Rev 5's
+ * ordering fix.  Root cause (finally confirmed): the rknpu device uses the
+ * Rockchip IOMMU (rk3568-iommu, fdab9000.rknpu_mmu) which has a HARDWARE
+ * LIMIT of 32-bit IOVA (4 GB).  Widening the DMA mask to 40-bit has no effect
+ * on the Rockchip IOMMU's page-table address space.
+ *
+ * Additionally, dma_alloc_noncontiguous() uses size_aligned=true in
+ * alloc_iova_fast(), which forces the 2.4 GB buffer to be aligned to
+ *   2^fls_long(638208-1) = 2^20 PFN = 4 GB.
+ * Inside a 4 GB IOVA domain the only 4 GB-aligned address is 0x0, which is
+ * reserved (start_pfn=1).  The allocation fails regardless of DMA mask.
+ *
+ * Fix (rev 6): bypass the DMA IOVA allocator entirely for large allocations.
+ *
+ *   1. Allocate physical pages individually with alloc_page(GFP_KERNEL).
+ *
+ *   2. Assign an IOVA from a module-level cursor (rknpu_iova_cursor) that
+ *      starts at RKNPU_IOVA_BASE (1 MB) and grows upward in steps of the
+ *      allocation size (rounded up to RKNPU_IOVA_ALIGN, 1 GB).  The DMA IOVA
+ *      allocator works top-down from near 4 GB; our cursor grows bottom-up;
+ *      they do not overlap for the typical use-case of a few large buffers.
+ *
+ *   3. Map each page at cursor_iova + i*PAGE_SIZE via iommu_map().  Unlike
+ *      dma_alloc_noncontiguous(), iommu_map() writes page-table entries
+ *      directly with no alignment constraint beyond PAGE_SIZE.  The NPU
+ *      hardware sees a flat contiguous IOVA window.
+ *
+ *   4. vmap() the physical pages to provide a contiguous kernel virtual
+ *      address (kv_addr) for rknpu_job.c.
+ *
+ * Bug 55 (fix, rev 7): dma_map_sgtable() for medium-sized buffers (e.g.
+ * 80–150 MB) can return nents > 1 when the IOVA allocator (top-down from
+ * 4 GB) cannot find a single contiguous IOVA window of the required size due
+ * to IOVA fragmentation.  The NPU hardware accesses each buffer as a flat
+ * contiguous IOVA range starting at dma_addr; a mapping with nents=3 only
+ * covers the first physical run in IOVA space.  When the NPU reads or writes
+ * past that run it hits an unmapped IOVA → Rockchip IOMMU fault → DMA stall
+ * → run task counter: 0.  Confirmed: buffer 5 (126 MB) maps at
+ * dma_addr=0xd8000000 nents=3 every boot; inference always fails there.
+ *
+ * Fix (rev 7): route ALL allocations through the manual iommu_map() cursor
+ * path unconditionally (RKNPU_MEM_LARGE_THR = 0).  Change RKNPU_IOVA_ALIGN
+ * from 1 GB to PAGE_SIZE so the cursor advances by exactly the allocation
+ * size with no padding waste.  This guarantees a single contiguous IOVA
+ * region for every buffer regardless of physical memory layout.  The
+ * bottom-up cursor (starting at 1 MB) and the DMA allocator's top-down
+ * region remain non-overlapping for the typical rkllama/gemma2 workload
+ * (~2.8 GB total; cursor tops out at ~0xB5000000, well below 4 GB).
+ *
+ * Bug 55 (fix, rev 8): "run task counter: 0" persists even though all
+ * iommu_map() calls succeed.  Root cause: rknpu_mem_create_ioctl was
+ * returning the caller's requested iommu_domain_id unchanged.  librknnrt
+ * calls RKNPU_ACTION/RKNPU_SET_IOMMU_DOMAIN_ID to request domain 10 before
+ * making allocations, then reads back the iommu_domain_id from each
+ * RKNPU_MEM_CREATE response and uses it when submitting jobs via
+ * RKNPU_SUBMIT_TASK.  On Android GKI (CONFIG_NO_GKI), rknpu_iommu_switch_
+ * domain() creates a new IOMMU_DOMAIN_UNMANAGED context and attaches the
+ * device to it; allocations and jobs all live in domain 10.  On Talos
+ * (!CONFIG_NO_GKI) the switch is a no-op stub — the device stays on its
+ * default DMA domain (domain 0) — but domain_id=10 was echoed back to
+ * librknnrt unchanged.  librknnrt therefore submitted every job tagged
+ * iommu_domain_id=10 while rknpu_dev->iommu_domain_id remained 0.
+ * rknpu_job.c logs "job iommu domain id: 10, dev iommu domain id: 0" on
+ * every timeout.  The mismatch did not gate execution (rknpu_iommu_domain_
+ * get_and_switch is also a no-op), but it confused whatever per-domain
+ * bookkeeping the NPU firmware uses, causing it to never signal completion.
+ *
+ * Fix (rev 8): override args.iommu_domain_id = 0 before copy_to_user.
+ * This tells librknnrt that every buffer lives in domain 0, which is the
+ * domain the device actually operates in.  librknnrt then submits jobs with
+ * iommu_domain_id=0, matching rknpu_dev->iommu_domain_id=0.
+ *
+ * Bug 55 (fix, rev 9): "run task counter: 0, int status: 0" persists despite
+ * correct iommu_map() IOVA assignments and domain-id=0 synchronisation.
+ * Root cause: CPU cache coherency mismatch between three virtual aliases for
+ * the same physical pages:
+ *
+ *   (a) alloc_page(__GFP_ZERO) zeroes pages via the kernel direct map
+ *       (PAGE_KERNEL, writeback cacheable).  The L1/L2 caches now hold
+ *       clean zero lines for every page we allocated.
+ *
+ *   (b) librknnrt mmaps the anon-inode fd via rknpu_mem_obj_mmap(), which
+ *       uses pgprot_writecombine (Normal-NC on ARM64).  Write-combining
+ *       stores bypass L1/L2 caches and go directly to DRAM.  The CPU
+ *       caches still hold stale zeros.
+ *
+ *   (c) rknpu_job.c reads task struct fields (e.g. first_task->regcmd_addr)
+ *       via task_obj->kv_addr, which was vmap'd with PAGE_KERNEL
+ *       (writeback cacheable).  This hits L1/L2 caches — which still hold
+ *       the stale zero lines from step (a).  The kernel reads zero for all
+ *       task fields (regcmd_addr = 0, etc.).
+ *
+ *   (d) The kernel writes 0 to RKNPU_OFFSET_PC_DATA_ADDR.  The NPU
+ *       attempts to fetch register-command data from IOVA 0, which is
+ *       unmapped.  The Rockchip IOMMU silently drops the access.  The NPU
+ *       stalls and never fires a completion interrupt: int_status remains 0.
+ *
+ * librknnrt was written for Android where the DMA API allocates non-
+ * cacheable (Normal-NC) coherent memory; explicit RKNPU_MEM_SYNC calls are
+ * therefore not needed and librknnrt does not issue them for task-descriptor
+ * buffers.  Our alloc_page() + iommu_map() path uses ordinary cacheable
+ * pages, creating the alias conflict.
+ *
+ * Fix (rev 9): map kv_addr with pgprot_writecombine(PAGE_KERNEL) instead of
+ * PAGE_KERNEL.  Normal-NC reads bypass L1/L2 and fetch directly from DRAM,
+ * which holds the correct task data written by librknnrt via its own NC mmap.
+ * The DMA (NPU via IOMMU) accesses DRAM directly too — both sides now see the
+ * same DRAM content with no flush needed.
+ *
+ * Bug 55 (diagnostic, rev 11): add dev_info() in rknpu_job_subcore_commit_pc()
+ * to print first_task->regcmd_addr, first_task->int_mask, and
+ * args->task_base_addr at job commit time, so we can determine whether
+ * the stale-zero cache hypothesis (regcmd_addr=0) is confirmed or refuted.
+ * No functional change in rknpu_mem.c itself.
+ *
+ * Bug 55 (fix, rev 10): "run task counter: 0" persists after rev 9.
+ * Root cause: the ARM Cortex-A55 and A76 Technical Reference Manuals
+ * explicitly state that Normal Non-Cacheable (NC) reads are
+ * IMPLEMENTATION DEFINED with respect to existing cache contents:
+ *
+ *   "If a clean cache line exists in the cache for the address being
+ *    accessed, a non-cacheable read might return the cached value."
+ *
+ * alloc_page(__GFP_ZERO) zeroes pages via the writeback-cacheable direct
+ * map, depositing clean zero lines in L1/L2.  Rev 9's pgprot_writecombine
+ * kv_addr does NOT guarantee that reads bypass those existing lines.
+ * rknpu_job.c's read of first_task->regcmd_addr may still return stale
+ * zeros (→ IOVA 0 → NPU IOMMU fault → int_status: 0).
+ *
+ * Fix (rev 10): call flush_dcache_page() for each page immediately after
+ * alloc_page().  flush_dcache_page() issues ARM64 "DC CIVAC" (clean and
+ * invalidate to the Point of Coherency) for every cache line in the page.
+ * After this call, no valid L1/L2 lines exist for those physical pages.
+ * Between this flush and the later rknpu_job.c read via kv_addr, no kernel
+ * code accesses the page content via the direct map (vmap, iommu_map, and
+ * anon_inode_getfd touch only page tables, not page data).  librknnrt
+ * subsequently writes task data via its pgprot_writecombine mmap (→ DRAM
+ * directly).  When rknpu_job.c reads via kv_addr (Normal-NC), the L1/L2
+ * has no valid lines → guaranteed cold miss → fetches correct data from
+ * DRAM.  Belt-and-suspenders: pgprot_writecombine (rev 9) is retained for
+ * kv_addr so that, should any CPU speculatively re-populate a cache line
+ * with zeros before the job commit, the NC read still bypasses it.
+ *
+ * struct rknpu_mem_buf wraps rknpu_mem_object with the fields needed for
+ * teardown.  rknpu_mem_object MUST remain the first member so that
+ * (struct rknpu_mem_object *)obj_addr is the same address as
+ * (struct rknpu_mem_buf *)obj_addr.
+ */
+
+#include <linux/anon_inodes.h>
+#include <linux/atomic.h>
+#include <linux/dma-mapping.h>
+#include <linux/errno.h>
+#include <linux/fs.h>
+#include <linux/highmem.h>
+#include <linux/iommu.h>
+#include <linux/mm.h>
+#include <linux/scatterlist.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/vmalloc.h>
+
+#include "include/rknpu_drv.h"
+#include "include/rknpu_mem.h"
+
+/*
+ * Bug 55 rev 7: route ALL allocations through iommu_map() by setting the
+ * threshold to 0 (condition buf->mem.size > 0 is always true for non-empty
+ * allocations).  dma_map_sgtable() can produce nents > 1 for medium buffers
+ * (IOVA fragmentation), causing NPU IOMMU faults.  The dma_map_sgtable path
+ * below is retained as dead code for reference only.
+ */
+#define RKNPU_MEM_LARGE_THR  (0UL)
+
+/*
+ * Manual IOVA allocator for ALL allocations (Bug 55 rev 7: threshold = 0).
+ *
+ * RKNPU_IOVA_BASE: starting IOVA.  1 MB keeps us above the IOMMU's
+ * reserved zero page.  The DMA allocator (top-down from ~4 GB) is not used
+ * by our code any more, so there is no overlap concern.
+ *
+ * RKNPU_IOVA_ALIGN: PAGE_SIZE — the cursor advances by exactly the
+ * allocation size (already page-aligned).  For a typical rkllama/gemma2
+ * workload (~2.8 GB total), the cursor tops out around 0xB5000000, well
+ * within the Rockchip IOMMU's 32-bit IOVA space.
+ */
+#define RKNPU_IOVA_BASE   (1UL << 20)            /* 1 MB */
+#define RKNPU_IOVA_ALIGN  PAGE_SIZE              /* page-size stride, no waste */
+
+static atomic64_t rknpu_iova_cursor = ATOMIC64_INIT(RKNPU_IOVA_BASE);
+
+/*
+ * rknpu_mem_buf — private per-allocation state.
+ *
+ * mem MUST be the first member: the submit path in rknpu_job.c does
+ *   task_obj = (struct rknpu_mem_object *)(uintptr_t)task_obj_addr
+ * where task_obj_addr == obj_addr returned by rknpu_mem_create_ioctl.
+ * Placing mem first makes (struct rknpu_mem_object *)obj_addr == &buf->mem.
+ *
+ * use_iommu_map selects the allocation path for large buffers:
+ *   true  — iommu_map() path (large allocations, Bug 55 rev 6).
+ *            Teardown: iommu_unmap() + vunmap() + __free_page() × N.
+ *            iommu_iova holds the manually-assigned IOVA base.
+ *   false — alloc_page() per page + dma_map_sgtable() path (small buffers).
+ *           Teardown: vunmap() + dma_unmap_sgtable() + sg_free_table() +
+ *           __free_page() × N.
+ *
+ * In both paths, pages[] and nr_pages track the physical pages.
+ */
+struct rknpu_mem_buf {
+	struct rknpu_mem_object  mem;		/* MUST be first — cast target in submit */
+	struct device		*dev;		/* device for DMA ops */
+	bool			 use_iommu_map;	/* true: direct iommu_map large path */
+	unsigned long		 iommu_iova;	/* IOVA base (iommu_map path only) */
+	struct sg_table		 sgt;		/* scatter-gather (small path only) */
+	struct page		**pages;	/* physical pages (both paths) */
+	unsigned long		 nr_pages;	/* number of pages (both paths) */
+};
+
+static int rknpu_mem_obj_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct rknpu_mem_buf *buf = filp->private_data;
+	struct page **pages = buf->pages;
+	unsigned long addr = vma->vm_start;
+	unsigned long i;
+
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+
+	for (i = 0; i < buf->nr_pages && addr < vma->vm_end; i++) {
+		if (remap_pfn_range(vma, addr, page_to_pfn(pages[i]),
+				    PAGE_SIZE, vma->vm_page_prot))
+			return -EAGAIN;
+		addr += PAGE_SIZE;
+	}
+	return 0;
+}
+
+static int rknpu_mem_obj_release(struct inode *inode, struct file *filp)
+{
+	struct rknpu_mem_buf *buf = filp->private_data;
+	unsigned long i;
+
+	if (buf->use_iommu_map) {
+		struct iommu_domain *domain = iommu_get_domain_for_dev(buf->dev);
+
+		vunmap(buf->mem.kv_addr);
+		if (domain)
+			iommu_unmap(domain, buf->iommu_iova, buf->mem.size);
+	} else {
+		vunmap(buf->mem.kv_addr);
+		dma_unmap_sgtable(buf->dev, &buf->sgt, DMA_BIDIRECTIONAL, 0);
+		sg_free_table(&buf->sgt);
+	}
+
+	for (i = 0; i < buf->nr_pages; i++)
+		__free_page(buf->pages[i]);
+	vfree(buf->pages);
+	kfree(buf);
+	return 0;
+}
+
+static const struct file_operations rknpu_mem_obj_fops = {
+	.owner		= THIS_MODULE,
+	.mmap		= rknpu_mem_obj_mmap,
+	.release	= rknpu_mem_obj_release,
+};
+
+int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+			   unsigned int cmd, unsigned long data)
+{
+	struct rknpu_mem_create args;
+	struct rknpu_mem_buf *buf;
+	unsigned long i = 0;
+	int ret, fd;
+
+	if (copy_from_user(&args, (void __user *)data, sizeof(args)))
+		return -EFAULT;
+
+	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	buf->dev      = rknpu_dev->dev;
+	buf->mem.flags = args.flags;
+	buf->mem.size  = PAGE_ALIGN(args.size);
+	buf->nr_pages  = buf->mem.size >> PAGE_SHIFT;
+
+	/* Allocate physical pages (both paths). */
+	buf->pages = vmalloc(buf->nr_pages * sizeof(struct page *));
+	if (!buf->pages) {
+		kfree(buf);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < buf->nr_pages; i++) {
+		buf->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!buf->pages[i]) {
+			dev_err(buf->dev,
+				"rknpu_mem: alloc_page failed at %lu/%lu (size=%zu)\n",
+				i, buf->nr_pages, buf->mem.size);
+			ret = -ENOMEM;
+			goto err_free_pages;
+		}
+		/*
+		 * Bug 55 rev 10: clean and invalidate this page's cache lines.
+		 *
+		 * alloc_page(__GFP_ZERO) zeroes the page via the writeback-
+		 * cacheable direct map, leaving clean zero lines in L1/L2.
+		 * ARM Cortex-A55/A76 TRM: NC reads "might return the cached
+		 * value" if a clean line exists.  Invalidate here so that the
+		 * first kernel read via kv_addr (in rknpu_job_subcore_commit_pc)
+		 * is guaranteed to be a cold miss → DRAM → librknnrt's data.
+		 *
+		 * No kernel code accesses this page's content between here and
+		 * the job-commit read: vmap/iommu_map/anon_inode_getfd all
+		 * operate on page tables, not page data.
+		 */
+		flush_dcache_page(buf->pages[i]);
+	}
+
+	if (buf->mem.size > RKNPU_MEM_LARGE_THR) {
+		/*
+		 * Bug 55 rev 6: large allocation path.
+		 *
+		 * The Rockchip IOMMU has a 32-bit (4 GB) IOVA space.
+		 * dma_alloc_noncontiguous() requires 4 GB alignment for a
+		 * 2.4 GB buffer (size_aligned=true constraint), which is
+		 * impossible in a 4 GB domain (only valid 4 GB-aligned address
+		 * is 0x0 = reserved).
+		 *
+		 * Instead: assign a manually-managed IOVA from the bottom of
+		 * the address space (rknpu_iova_cursor, starting at 1 MB) and
+		 * map each physical page directly with iommu_map().  iommu_map()
+		 * has no alignment constraint beyond PAGE_SIZE.
+		 *
+		 * The DMA IOVA allocator works top-down (small allocs land near
+		 * 0xfe000000); our cursor grows bottom-up from 1 MB.  They do
+		 * not overlap for the typical use-case of one or two large
+		 * model-weight buffers.
+		 */
+		struct iommu_domain *domain;
+		unsigned long iova, mapped = 0;
+		unsigned long stride;
+
+		domain = iommu_get_domain_for_dev(buf->dev);
+		if (!domain) {
+			dev_err(buf->dev,
+				"rknpu_mem: iommu_get_domain_for_dev failed\n");
+			ret = -ENODEV;
+			goto err_free_pages;
+		}
+
+		stride = ALIGN(buf->mem.size, RKNPU_IOVA_ALIGN);
+		iova = (unsigned long)atomic64_fetch_add((s64)stride,
+							 &rknpu_iova_cursor);
+		buf->iommu_iova   = iova;
+		buf->use_iommu_map = true;
+
+		dev_info(buf->dev,
+			 "rknpu_mem: iommu_map alloc %zu bytes iova=0x%lx (%lu pages)\n",
+			 buf->mem.size, iova, buf->nr_pages);
+
+		/* Map pages into the IOMMU page table, coalescing contiguous
+		 * physical runs to reduce iommu_map() call count. */
+		while (mapped < buf->nr_pages) {
+			unsigned long run = mapped;
+			phys_addr_t base = page_to_phys(buf->pages[mapped]);
+			size_t run_size;
+
+			/* Extend run while physically contiguous. */
+			while (mapped + 1 < buf->nr_pages &&
+			       page_to_phys(buf->pages[mapped + 1]) ==
+			       page_to_phys(buf->pages[mapped]) + PAGE_SIZE)
+				mapped++;
+
+			run_size = (mapped - run + 1) * PAGE_SIZE;
+			ret = iommu_map(domain,
+					iova + (run << PAGE_SHIFT),
+					base, run_size,
+					IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
+					GFP_KERNEL);
+			if (ret) {
+				dev_err(buf->dev,
+					"rknpu_mem: iommu_map failed at iova=0x%lx size=%zu: %d\n",
+					iova + (run << PAGE_SHIFT), run_size,
+					ret);
+				/* Unmap what was already mapped. */
+				if (run > 0)
+					iommu_unmap(domain, iova,
+						    run << PAGE_SHIFT);
+				goto err_free_pages;
+			}
+			mapped++;
+		}
+
+		dev_info(buf->dev,
+			 "rknpu_mem: iommu_map OK iova=0x%lx size=%zu\n",
+			 iova, buf->mem.size);
+
+		buf->mem.dma_addr = (dma_addr_t)iova;
+
+		/*
+		 * Bug 55 rev 9: use Normal-NC (write-combining) for kv_addr so
+		 * kernel reads in rknpu_job.c bypass L1/L2 caches and fetch
+		 * task data directly from DRAM, where librknnrt wrote it via its
+		 * own pgprot_writecombine mmap.  PAGE_KERNEL (writeback cached)
+		 * would return stale zeros left by alloc_page(__GFP_ZERO).
+		 */
+		buf->mem.kv_addr = vmap(buf->pages, buf->nr_pages,
+					VM_MAP, pgprot_writecombine(PAGE_KERNEL));
+		if (!buf->mem.kv_addr) {
+			dev_err(buf->dev,
+				"rknpu_mem: vmap failed (nr_pages=%lu)\n",
+				buf->nr_pages);
+			iommu_unmap(domain, iova, buf->mem.size);
+			ret = -ENOMEM;
+			goto err_free_pages;
+		}
+
+	} else {
+		/*
+		 * Small allocation path (≤ 256 MiB): build sg_table from pages
+		 * and map through the DMA subsystem.  For small buffers the
+		 * buddy allocator typically returns physically-contiguous pages
+		 * (nents=1), so the IOVA mapping is a single window and the NPU
+		 * hardware accesses the buffer correctly.
+		 */
+		ret = sg_alloc_table_from_pages(&buf->sgt, buf->pages,
+						buf->nr_pages,
+						0, buf->mem.size, GFP_KERNEL);
+		if (ret) {
+			dev_err(buf->dev,
+				"rknpu_mem: sg_alloc_table_from_pages failed: %d\n",
+				ret);
+			goto err_free_pages;
+		}
+
+		dev_info(buf->dev,
+			 "rknpu_mem: mapping %zu bytes (%lu pages) dma_mask=0x%llx\n",
+			 buf->mem.size, buf->nr_pages,
+			 buf->dev->dma_mask ? *buf->dev->dma_mask : 0ULL);
+
+		ret = dma_map_sgtable(buf->dev, &buf->sgt, DMA_BIDIRECTIONAL,
+				      0);
+		if (ret) {
+			dev_err(buf->dev,
+				"rknpu_mem: dma_map_sgtable failed: %d (size=%zu nents=%u)\n",
+				ret, buf->mem.size, buf->sgt.nents);
+			goto err_free_sgt;
+		}
+
+		dev_info(buf->dev,
+			 "rknpu_mem: mapped OK dma_addr=0x%llx nents=%u\n",
+			 (u64)sg_dma_address(buf->sgt.sgl), buf->sgt.nents);
+
+		buf->mem.dma_addr = sg_dma_address(buf->sgt.sgl);
+
+		/* Bug 55 rev 9: Normal-NC for the same coherency reason. */
+		buf->mem.kv_addr = vmap(buf->pages, buf->nr_pages,
+					VM_MAP, pgprot_writecombine(PAGE_KERNEL));
+		if (!buf->mem.kv_addr) {
+			dev_err(buf->dev,
+				"rknpu_mem: vmap failed (nr_pages=%lu)\n",
+				buf->nr_pages);
+			ret = -ENOMEM;
+			goto err_unmap_sgt;
+		}
+	}
+
+	/*
+	 * Bug 55 rev 55d: expose buf->pages via buf->mem.pages so that
+	 * rknpu_job.c's task_obj->pages is non-NULL.  With pages=NULL the
+	 * r44 flush_dcache_page loop never runs (falls back to
+	 * dma_sync_single which is a no-op for IOMMU-mapped allocations).
+	 * With pages set, each task descriptor page is flushed by physical
+	 * address before NPU DMA, ensuring DRAM coherency.
+	 */
+	buf->mem.pages = buf->pages;
+
+	/*
+	 * Create a userspace-mmappable fd.  Memory freed via release callback
+	 * when the fd is closed.
+	 */
+	fd = anon_inode_getfd("[rknpu_mem]", &rknpu_mem_obj_fops, buf,
+			      O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		ret = fd;
+		goto err_vunmap;
+	}
+
+	args.handle   = (__u32)fd;
+	args.dma_addr = buf->mem.dma_addr;
+	/*
+	 * obj_addr: pointer to the embedded rknpu_mem_object struct.
+	 *
+	 * rknpu_job.c:rknpu_job_subcore_commit_pc() casts task_obj_addr as
+	 *   (struct rknpu_mem_object *)(uintptr_t)task_obj_addr
+	 * and reads ->kv_addr to locate the command/task array.
+	 */
+	args.obj_addr = (u64)(uintptr_t)&buf->mem;
+	/*
+	 * Bug 55 rev 8: force domain 0.
+	 *
+	 * rknpu_iommu_switch_domain() is a no-op stub on Talos (!CONFIG_NO_GKI).
+	 * The device always uses its default DMA domain (domain 0).  All buffers
+	 * are mapped in domain 0 via iommu_map(iommu_get_domain_for_dev()).
+	 * Override any domain the caller requested so librknnrt submits jobs with
+	 * iommu_domain_id=0, matching rknpu_dev->iommu_domain_id=0.
+	 */
+	args.iommu_domain_id = 0;
+
+	if (copy_to_user((void __user *)data, &args, sizeof(args))) {
+		/* fd installed; caller must close to free memory */
+		return -EFAULT;
+	}
+
+	return 0;
+
+err_vunmap:
+	vunmap(buf->mem.kv_addr);
+	if (buf->use_iommu_map) {
+		struct iommu_domain *domain = iommu_get_domain_for_dev(buf->dev);
+
+		if (domain)
+			iommu_unmap(domain, buf->iommu_iova, buf->mem.size);
+		goto err_free_pages;
+	}
+err_unmap_sgt:
+	dma_unmap_sgtable(buf->dev, &buf->sgt, DMA_BIDIRECTIONAL, 0);
+err_free_sgt:
+	sg_free_table(&buf->sgt);
+err_free_pages:
+	/* free pages that were successfully allocated (indices 0..i-1) */
+	while (i > 0)
+		__free_page(buf->pages[--i]);
+	vfree(buf->pages);
+	kfree(buf);
+	return ret;
+}
+
+int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+			    unsigned long data)
+{
+	/*
+	 * Memory lifetime is tied to the fd returned by rknpu_mem_create_ioctl.
+	 * Closing the fd triggers rknpu_mem_obj_release → DMA teardown.
+	 * No explicit destroy action is needed here.
+	 */
+	return 0;
+}
+
+int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
+{
+	struct rknpu_mem_sync args;
+	struct rknpu_mem_buf *buf;
+	unsigned long i;
+
+	if (copy_from_user(&args, (void __user *)data, sizeof(args)))
+		return -EFAULT;
+
+	if (!args.obj_addr)
+		return -EINVAL;
+
+	/*
+	 * obj_addr is &buf->mem (filled by rknpu_mem_create_ioctl).
+	 * mem is the first member of rknpu_mem_buf so the two pointers
+	 * are identical — no container_of offset arithmetic needed.
+	 */
+	buf = (struct rknpu_mem_buf *)(uintptr_t)args.obj_addr;
+
+	if (buf->use_iommu_map) {
+		/*
+		 * Large-path: pages were mapped via iommu_map(), bypassing the
+		 * DMA subsystem.  The Rockchip IOMMU does not participate in
+		 * the ARM64 cache-coherency domain, so cache maintenance must
+		 * be done explicitly.
+		 *
+		 * kv_addr is now pgprot_writecombine (Normal-NC, Bug 55 rev 9),
+		 * so kernel reads in rknpu_job.c already bypass L1/L2 caches
+		 * and fetch directly from DRAM.  However the direct-map alias
+		 * (used by alloc_page/__GFP_ZERO) is still writeback-cacheable
+		 * and may hold stale lines.  flush_dcache_page() cleans and
+		 * invalidates those lines, ensuring any NPU writes to the buffer
+		 * (FROM_DEVICE) are visible when the CPU next reads via the
+		 * direct map, and preventing eviction of stale direct-map lines
+		 * from corrupting DRAM after librknnrt's NC writes.
+		 */
+		for (i = 0; i < buf->nr_pages; i++)
+			flush_dcache_page(buf->pages[i]);
+	} else {
+		/*
+		 * Small-path: buffer was mapped via dma_map_sgtable().  Use
+		 * the DMA layer for cache maintenance so that the Rockchip
+		 * IOMMU driver can do any platform-specific work it needs.
+		 */
+		if (args.flags & RKNPU_MEM_SYNC_TO_DEVICE)
+			dma_sync_sg_for_device(buf->dev, buf->sgt.sgl,
+					       buf->sgt.nents, DMA_TO_DEVICE);
+		if (args.flags & RKNPU_MEM_SYNC_FROM_DEVICE)
+			dma_sync_sg_for_cpu(buf->dev, buf->sgt.sgl,
+					    buf->sgt.nents, DMA_FROM_DEVICE);
+	}
+
+	return 0;
+}
