@@ -75,6 +75,17 @@ mkdir -p /usr/src/rknpu-0.9.8
 cp -r /tmp/rknpu-module/. /usr/src/rknpu-0.9.8/
 rm -rf /tmp/rknpu-module
 
+# Drop in Talos's rknpu_mem.c — upstream w568w doesn't ship this file
+# at all (the memory-allocation ioctl backends rknpu_mem_create_ioctl,
+# rknpu_mem_destroy_ioctl, rknpu_mem_sync_ioctl are *declared* but
+# never *defined* upstream). Without it, modpost fails with three
+# "undefined symbol" errors. Talos wrote a from-scratch ~700-line
+# implementation for mainline (IOVA cursor, dma_alloc_noncontiguous,
+# fallbacks for missing rk-dma-heap). GPL-2.0 same as the rest. Sourced
+# from this repo's npu-patches/ dir, copied during chroot build.
+install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/rknpu_mem.c \
+    /usr/src/rknpu-0.9.8/src/rknpu_mem.c
+
 # Patch rknpu_gem.c: rknpu_gem_sync_ioctl uses rknpu_dev->fake_dev
 # unconditionally, but the field is only declared under
 # CONFIG_ROCKCHIP_RKNPU_DRM_GEM. In our DMA_HEAP build this function is
@@ -97,6 +108,10 @@ sed -i 's/rknpu_dev->fake_dev/rknpu_dev->dev/g' /usr/src/rknpu-0.9.8/src/rknpu_g
 # functions. Loses DVFS (NPU runs at fixed clock rate); functional
 # inference is unaffected.
 sed -i 's@src/rknpu_devfreq\.o@@g' /usr/src/rknpu-0.9.8/Kbuild
+# Add src/rknpu_mem.o to the obj list (we just dropped its .c above).
+# Append after src/rknpu_iommu.o which is one of the existing entries.
+sed -i '0,/src\/rknpu_iommu\.o/{s@src/rknpu_iommu\.o@& src/rknpu_mem.o@}' \
+    /usr/src/rknpu-0.9.8/Kbuild
 echo '# Force devfreq-stub path (no devfreq-governor.h in Armbian-current)' \
     >> /usr/src/rknpu-0.9.8/Kbuild
 echo 'ccflags-y += -DRKNPU_NO_DEVFREQ' >> /usr/src/rknpu-0.9.8/Kbuild
