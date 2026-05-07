@@ -74,6 +74,16 @@ git clone --depth=1 https://github.com/w568w/rknpu-module.git /tmp/rknpu-module
 mkdir -p /usr/src/rknpu-0.9.8
 cp -r /tmp/rknpu-module/. /usr/src/rknpu-0.9.8/
 rm -rf /tmp/rknpu-module
+
+# Patch Kbuild to drop rknpu_devfreq.o. Armbian-current's kernel ships
+# CONFIG_PM_DEVFREQ=n, so linux/devfreq-governor.h isn't installed and
+# rknpu_devfreq.c fails to compile. The rknpu_devfreq.h header already
+# provides inline stubs for all devfreq functions when CONFIG_PM_DEVFREQ
+# is unset, so dropping the .o is safe — the rest of the driver runs
+# fine, just without DVFS. Same patch Talos's production stack uses.
+sed -i 's@^\(.*\)src/rknpu_devfreq\.o\(.*\)$@# disabled: \1src/rknpu_devfreq.o\2 (CONFIG_PM_DEVFREQ=n on Armbian-current)@' \
+    /usr/src/rknpu-0.9.8/Kbuild
+
 dkms add rknpu/0.9.8
 
 # Build/install for every kernel version present in /lib/modules. In
@@ -112,7 +122,6 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/power/rk3588-power.h>
 #include <dt-bindings/clock/rockchip,rk3588-cru.h>
-#include <dt-bindings/reset/rockchip,rk3588-cru.h>
 
 / {
     compatible = "rockchip,rk3588";
@@ -141,17 +150,12 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
         clocks = <&scmi_clk SCMI_CLK_NPU>;
         clock-names = "clk_npu";
 
-        resets = <&cru SRST_A_RKNN_NODDR>;
-        reset-names = "srst_a";
-
         power-domains = <&power RK3588_PD_NPUTOP>,
                         <&power RK3588_PD_NPU1>,
                         <&power RK3588_PD_NPU2>;
         power-domain-names = "nputop", "npu1", "npu2";
 
         iommus = <&rknn_mmu_0>, <&rknn_mmu_1>, <&rknn_mmu_2>;
-
-        operating-points-v2 = <&npu_opp_table>;
 
         npu-supply = <&vdd_npu_s0>;
         sram-supply = <&vdd_npu_s0>;
