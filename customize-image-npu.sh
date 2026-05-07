@@ -75,14 +75,22 @@ mkdir -p /usr/src/rknpu-0.9.8
 cp -r /tmp/rknpu-module/. /usr/src/rknpu-0.9.8/
 rm -rf /tmp/rknpu-module
 
-# Patch Kbuild to drop rknpu_devfreq.o. Armbian-current's kernel ships
-# CONFIG_PM_DEVFREQ=n, so linux/devfreq-governor.h isn't installed and
-# rknpu_devfreq.c fails to compile. The rknpu_devfreq.h header already
-# provides inline stubs for all devfreq functions when CONFIG_PM_DEVFREQ
-# is unset, so dropping the .o is safe — the rest of the driver runs
-# fine, just without DVFS. Same patch Talos's production stack uses.
-sed -i 's@^\(.*\)src/rknpu_devfreq\.o\(.*\)$@# disabled: \1src/rknpu_devfreq.o\2 (CONFIG_PM_DEVFREQ=n on Armbian-current)@' \
-    /usr/src/rknpu-0.9.8/Kbuild
+# Patch Kbuild to (a) drop rknpu_devfreq.o and (b) define
+# RKNPU_NO_DEVFREQ globally. Armbian-current's kernel headers don't
+# install linux/devfreq-governor.h (CONFIG_PM_DEVFREQ may be enabled
+# but the governor header just isn't shipped in the headers package),
+# so rknpu_devfreq.c fails to compile. rknpu_devfreq.h has inline
+# stubs for all six devfreq functions, but they're only used when
+# RKNPU_NO_DEVFREQ is defined — otherwise the function prototypes
+# get declared, the .o is required, and linking fails with
+# "undefined symbol: rknpu_devfreq_*". So we drop the .o AND set the
+# define so stubs kick in everywhere callers reference these
+# functions. Loses DVFS (NPU runs at fixed clock rate); functional
+# inference is unaffected.
+sed -i 's@src/rknpu_devfreq\.o@@g' /usr/src/rknpu-0.9.8/Kbuild
+echo '# Force devfreq-stub path (no devfreq-governor.h in Armbian-current)' \
+    >> /usr/src/rknpu-0.9.8/Kbuild
+echo 'ccflags-y += -DRKNPU_NO_DEVFREQ' >> /usr/src/rknpu-0.9.8/Kbuild
 
 dkms add rknpu/0.9.8
 
