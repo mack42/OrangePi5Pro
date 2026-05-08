@@ -79,25 +79,21 @@ cat > /etc/profile.d/rockchip-vaapi.sh <<'PROF'
 export LIBVA_DRIVER_NAME=rockchip
 PROF
 
-# --- 3. Bake in OrangePi5Pro repo + Plasma kdialog setup wizard ---
-# Two front-ends share the same six-prompt setup flow:
-#   - 03-setup.sh (TTY) → /usr/local/bin/orangepi-setup
-#     For SSH / minimal-image / power-user re-runs.
-#   - 03-setup-gui.sh (kdialog) → /usr/local/bin/orangepi-setup-gui
-#     Auto-launches once on first Plasma login (most users).
+# --- 3. Bake in OrangePi5Pro repo + orangepi-setup symlink ---
+# v1.6+ flow: the user goes through the entire setup on TTY (firstrun
+# + orangepi-setup), then reboots once into the final state (Plasma or
+# multi-user, based on what they chose at the prompt). The kdialog
+# wizard is kept around as a manually-launchable utility from the
+# application menu, but is NOT in /etc/xdg/autostart anymore — it
+# previously fired half-finished on first Plasma login and confused
+# everyone. See section 3b for SDDM gating.
 git clone --depth=1 https://github.com/mack42/OrangePi5Pro.git /usr/local/share/OrangePi5Pro
-ln -sf /usr/local/share/OrangePi5Pro/03-setup.sh                  /usr/local/bin/orangepi-setup
-ln -sf /usr/local/share/OrangePi5Pro/03-setup-gui.sh              /usr/local/bin/orangepi-setup-gui
-ln -sf /usr/local/share/OrangePi5Pro/orangepi-setup-gui-autostart.sh /usr/local/bin/orangepi-setup-gui-autostart
+ln -sf /usr/local/share/OrangePi5Pro/03-setup.sh     /usr/local/bin/orangepi-setup
+ln -sf /usr/local/share/OrangePi5Pro/03-setup-gui.sh /usr/local/bin/orangepi-setup-gui
 
-# Plasma autostart: the .desktop in /etc/xdg/autostart/ fires once per
-# user login. The autostart shim is the FIRST gate — it checks/touches
-# ~/.opi5pro-setup-done so the wizard auto-launches exactly once, even
-# if the user closes it mid-flow. Manual re-runs go through the
-# application launcher entry (no flag check, no auto-fire).
-mkdir -p /etc/xdg/autostart /usr/share/applications
-install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui.desktop \
-    /etc/xdg/autostart/orangepi-setup-gui.desktop
+# Application-launcher entry only — re-launchable from the K menu by
+# someone who specifically wants the GUI version. NOT auto-started.
+mkdir -p /usr/share/applications
 install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui-launcher.desktop \
     /usr/share/applications/orangepi-setup-gui.desktop
 
@@ -109,52 +105,45 @@ install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui-launcher.deskto
 bash /usr/local/share/OrangePi5Pro/customize-image-npu.sh || \
     echo "WARN: NPU stack install failed — image will boot without NPU support."
 
-# --- 3b. Default to graphical.target after armbian-firstlogin ---
-# The image has to ship with default.target = multi-user.target so the
-# very first boot reaches a TTY where /etc/profile.d/armbian-check-first-
-# login.sh can run armbian-firstlogin (root pw, user creation, locale —
-# SDDM can't host that wizard without an existing user account). Without
-# any further intervention, every reboot AFTER firstlogin would also
-# land at TTY, which is wrong for a desktop image.
+# --- 3b. Block SDDM until orangepi-setup completes ---
+# armbian-firstlogin runs `systemctl enable --now sddm` unconditionally
+# at the end of its TTY user-creation prompts. Without intervention the
+# user lands in Plasma immediately after firstrun — but at that point
+# the kdialog wizard would race armbian-firstlogin's still-running
+# session, the user has no idea what's going on, and on reboot the
+# system is back at TTY (because default.target is still multi-user)
+# with no clear instruction.
 #
-# Drop a oneshot service that runs at boot AFTER multi-user.target. Its
-# conditions only pass once firstlogin has completed (Armbian removes
-# /root/.not_logged_in_yet at that point) and we haven't already done
-# this work (sentinel /etc/.opi5pro-graphical-default-set). When it
-# fires, it flips default.target to graphical.target so subsequent boots
-# land in Plasma. Idempotent + self-marking.
+# v1.6+ design: keep the user on TTY through the entire flow.
+#   1. firstrun TTY prompts → user created
+#   2. firstlogin tries to start sddm, blocked by our condition
+#   3. user sees motd "Run: orangepi-setup", runs it
+#   4. orangepi-setup touches /etc/.opi5pro-setup-done-system on success
+#   5. user reboots ONCE
+#   6. sddm condition now passes; if user picked "auto-start Plasma",
+#      03-setup.sh has already flipped default.target to graphical.
 #
-# This is *belt-and-suspenders* — the kdialog wizard's prompt #1 also
-# offers the same flip in-session. Both paths are needed because:
-#   - The wizard requires the user to actually click through it.
-#   - The boot service catches users who never run the wizard.
-# set-default is just a symlink swap so doing it twice is harmless.
-cat > /etc/systemd/system/orangepi-graphical-default.service <<'GRSERVICE'
+# A drop-in is cleaner than masking sddm: enable status is preserved,
+# the unit just refuses to activate while the condition is false. No
+# error spam in the journal — condition mismatches are silent.
+mkdir -p /etc/systemd/system/sddm.service.d
+cat > /etc/systemd/system/sddm.service.d/orangepi-wait-setup.conf <<'WAIT'
+# Orange Pi 5 Pro: don't start SDDM until orangepi-setup has completed.
+# Removed (unblocked) by 03-setup.sh on successful run.
 [Unit]
-Description=Orange Pi 5 Pro: default to graphical.target after firstlogin
-ConditionPathExists=!/root/.not_logged_in_yet
-ConditionPathExists=!/etc/.opi5pro-graphical-default-set
-ConditionPathExists=/usr/bin/sddm
-After=multi-user.target armbian-firstrun.service
+ConditionPathExists=/etc/.opi5pro-setup-done-system
+WAIT
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c "systemctl set-default graphical.target && touch /etc/.opi5pro-graphical-default-set"
-
-[Install]
-WantedBy=multi-user.target
-GRSERVICE
-systemctl enable orangepi-graphical-default.service
-
-# --- 3c. motd tip: how to start Plasma when at TTY ---
-# Fires only when (a) we're a desktop image (sddm exists) and (b) sddm
-# isn't currently running (user is at TTY or SSH'd in with no GUI up).
-# Helps users who chose "no" to the wizard's auto-start prompt or who
-# Ctrl+Alt+F1'd out of Plasma and want to know how to get back.
+# --- 3c. motd tip: how to start Plasma when at TTY post-setup ---
+# Fires only when (a) sddm exists, (b) sddm isn't currently running,
+# AND (c) the system flag is set (so it only appears AFTER setup is
+# done — pre-setup it would be redundant with the orangepi-setup
+# reminder). Helps users who chose "no" to auto-start, or who
+# Ctrl+Alt+F1'd out of Plasma and want to bring it back manually.
 cat > /etc/update-motd.d/97-orangepi-plasma-tip <<'TIP'
 #!/bin/sh
 [ -x /usr/bin/sddm ] || exit 0
+[ -e /etc/.opi5pro-setup-done-system ] || exit 0
 systemctl is-active sddm.service >/dev/null 2>&1 && exit 0
 cat <<EOF
   Plasma desktop is not running.

@@ -227,7 +227,24 @@ fi
 
 echo
 echo "=== Setup complete ==="
-# Mark setup as done so the motd reminder suppresses on next login.
+# Per-user flag: suppresses the motd reminder for *this* user on next login.
 touch "$HOME/.opi5pro-setup-done"
-echo "If you changed the boot target, migrated to NVMe, installed HW video decode,"
-echo "or changed the framebuffer mode, reboot now: sudo reboot"
+# System-wide flag: unblocks SDDM (the desktop image's
+# /etc/systemd/system/sddm.service.d/orangepi-wait-setup.conf has a
+# ConditionPathExists on this) and silences any other system-level
+# "setup not done" gates. Touching it costs nothing on the minimal
+# image, and on the desktop image it's the lever that lets Plasma
+# start on the next boot if the user chose graphical.target above.
+sudo touch /etc/.opi5pro-setup-done-system
+
+echo
+echo "Reboot now to apply your choices:  sudo reboot"
+echo
+if [[ "$(systemctl get-default 2>/dev/null)" == "graphical.target" ]]; then
+    echo "Next boot will land you in Plasma."
+else
+    echo "Next boot will land you at the text console. Start Plasma manually with"
+    echo "  sudo systemctl start sddm"
+    echo "or flip the default permanently with"
+    echo "  sudo systemctl set-default graphical.target"
+fi
