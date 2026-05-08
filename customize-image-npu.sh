@@ -95,6 +95,42 @@ install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/rknpu_mem.c \
 # is a known upstream w568w gap that Talos patches similarly.
 sed -i 's/rknpu_dev->fake_dev/rknpu_dev->dev/g' /usr/src/rknpu-0.9.8/src/rknpu_gem.c
 
+# Patch rknpu_drv.c: probe() bails with -ENOMEM if rk_dma_heap_find
+# returns NULL for "rk-dma-heap-cma" (the BSP-only heap doesn't exist
+# on mainline, so our stub always returns NULL — the driver never
+# reaches probe-success and /dev/rknpu is never created). Convert the
+# fatal check into a warning so probe completes and Talos's vendored
+# rknpu_mem.c handles the missing heap at runtime via its IOVA-cursor
+# fallback. dmesg before this patch:
+#   RKNPU fdab0000.npu: RKNPU: failed to find cma heap
+#   RKNPU fdab0000.npu: probe with driver RKNPU failed with error -12
+python3 <<'PYPATCH'
+path = "/usr/src/rknpu-0.9.8/src/rknpu_drv.c"
+with open(path) as f:
+    src = f.read()
+old = (
+    '\trknpu_dev->heap = rk_dma_heap_find("rk-dma-heap-cma");\n'
+    '\tif (!rknpu_dev->heap) {\n'
+    '\t\tLOG_DEV_ERROR(dev, "failed to find cma heap\\n");\n'
+    '\t\tret = -ENOMEM;\n'
+    '\t\tgoto err_remove_drv;\n'
+    '\t}\n'
+    '\trk_dma_heap_set_dev(dev);'
+)
+new = (
+    '\trknpu_dev->heap = rk_dma_heap_find("rk-dma-heap-cma");\n'
+    '\tif (!rknpu_dev->heap)\n'
+    '\t\tdev_info(dev, "no cma heap; using mainline fallback at runtime\\n");\n'
+    '\telse\n'
+    '\t\trk_dma_heap_set_dev(dev);'
+)
+if old not in src:
+    raise SystemExit("ERROR: rknpu_drv.c CMA-heap probe block not found — upstream changed?")
+with open(path, "w") as f:
+    f.write(src.replace(old, new))
+print("patched rknpu_drv.c: CMA heap missing is now non-fatal at probe")
+PYPATCH
+
 # Patch Kbuild to (a) drop rknpu_devfreq.o and (b) define
 # RKNPU_NO_DEVFREQ globally. Armbian-current's kernel headers don't
 # install linux/devfreq-governor.h (CONFIG_PM_DEVFREQ may be enabled
