@@ -72,11 +72,16 @@ if dpkg -l kubuntu-desktop 2>/dev/null | grep -q '^ii'; then
         ask "      Auto-start the UI on boot? (currently no)" n
     fi
     if [[ "$ANSWER" == "y" ]]; then
+        # We patch armbian-firstlogin (in customize-image.sh) to skip
+        # its DM-autostart branch, so SDDM is NOT enabled on first
+        # boot. Enable it here, when the user explicitly opts in.
         sudo systemctl set-default graphical.target
+        sudo systemctl enable sddm.service 2>/dev/null
         echo "      → Will boot to graphical login (SDDM) on next reboot."
     else
         sudo systemctl set-default multi-user.target
-        echo "      → Will boot to text console on next reboot. Start GUI manually with 'startx'/'sudo systemctl start sddm'."
+        sudo systemctl disable sddm.service 2>/dev/null
+        echo "      → Will boot to text console on next reboot. Start GUI manually with 'sudo systemctl start sddm'."
     fi
 else
     echo "      → No desktop installed; skipping (system stays at text console)."
