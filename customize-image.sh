@@ -105,6 +105,32 @@ install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-setup-gui-launcher.deskto
 bash /usr/local/share/OrangePi5Pro/customize-image-npu.sh || \
     echo "WARN: NPU stack install failed — image will boot without NPU support."
 
+# --- 3a2. Make armbian-firstlogin take the "no DM" branch ---
+# armbian-firstlogin auto-detects sddm/lightdm/gdm3 (lines ~685-696
+# of /usr/lib/armbian/armbian-firstlogin in the v1.x.x package) and
+# takes a DM-specific branch that:
+#   1. Creates an autologin sddm.conf.d so the user is auto-logged-in
+#      to Plasma without a password prompt (security regression).
+#   2. Prints "Now starting desktop environment via sddm..."
+#   3. Runs `systemctl enable --now sddm` (silently no-op'd by our
+#      gate in section 3b, but the user can't tell that).
+#   4. exit 1's out before showing motd or a clean prompt.
+#
+# Net effect on the user: a confusing frozen screen on tty1 with no
+# clue what to do next. The "no DM detected" else-branch is what we
+# actually want — it `clear`s the screen, runs motd (which shows our
+# orangepi-setup reminder), and exits cleanly so the login shell drops
+# to a normal prompt.
+#
+# Patch: make the sddm/lightdm/gdm3 file-existence checks always
+# evaluate false, forcing the no-DM branch. Idempotent.
+fl=/usr/lib/armbian/armbian-firstlogin
+if grep -q '\[\[ -f /usr/bin/sddm \]\]' "$fl"; then
+    sed -i 's@\[\[ -f /usr/bin/sddm \]\]@false \&\& [[ -f /usr/bin/sddm ]]@' "$fl"
+    sed -i 's@\[\[ -f /usr/sbin/lightdm \]\]@false \&\& [[ -f /usr/sbin/lightdm ]]@' "$fl"
+    sed -i 's@\[\[ -f /usr/sbin/gdm3 \]\]@false \&\& [[ -f /usr/sbin/gdm3 ]]@' "$fl"
+fi
+
 # --- 3b. Block SDDM until orangepi-setup completes ---
 # armbian-firstlogin runs `systemctl enable --now sddm` unconditionally
 # at the end of its TTY user-creation prompts. Without intervention the
