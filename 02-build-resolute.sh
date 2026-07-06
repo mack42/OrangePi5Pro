@@ -73,6 +73,10 @@ FRAMEWORK_DIR="${WORK}/framework" "${script_dir}/apply-uutils-shim.sh"
 # inside the chroot during build.
 userpatches="${WORK}/framework/userpatches"
 mkdir -p "$userpatches"
+# Defensively drop any prior customize-image.sh before copying in the
+# desktop/minimal one — so a half-run of this script or a previous run
+# with different flags can't leak into the next build.
+rm -f "$userpatches/customize-image.sh"
 if [[ "$DESKTOP" == "yes" ]]; then
     echo ">>> Building image with KDE Plasma + HW video decode (MPP+rockchip-vaapi) baked in."
     echo ">>> Expect ~45-60 min and ~2 GB output."
