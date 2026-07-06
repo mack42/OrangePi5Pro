@@ -18,6 +18,12 @@ fi
 
 cd framework
 
+# Armbian's build framework picks up ANY userpatches/customize-image.sh
+# regardless of the release target. If a previous --desktop run of
+# 02-build-resolute.sh left one behind, it would silently inject KDE
+# Plasma into this "minimal" noble build. Scrub it.
+rm -f userpatches/customize-image.sh
+
 exec ./compile.sh \
     BOARD=orangepi5pro \
     BRANCH=vendor \
