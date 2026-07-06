@@ -2,7 +2,7 @@
 
 A working recipe to build and run **Ubuntu 26.04 LTS (Resolute Raccoon)** on the Orange Pi 5 Pro (Rockchip RK3588S), using Armbian's build framework with the **mainline (`current`)** Linux kernel for working GPU acceleration.
 
-As of May 2026 there is no off-the-shelf 26.04 image for this board. [Joshua Riek's `ubuntu-rockchip`](https://github.com/Joshua-Riek/ubuntu-rockchip) was archived on 29 April 2026, [Armbian's downloads page for the 5 Pro](https://www.armbian.com/orange-pi-5-pro/) only ships Debian Trixie, and Orange Pi's official downloads top out at 24.04. So we build it ourselves.
+Currently there is no off-the-shelf 26.04 image for this board. [Joshua Riek's `ubuntu-rockchip`](https://github.com/Joshua-Riek/ubuntu-rockchip) was archived on 29 April 2026, [Armbian's downloads page for the 5 Pro](https://www.armbian.com/orange-pi-5-pro/) only ships Debian Trixie, and Orange Pi's official downloads top out at 24.04. So we build it ourselves.
 
 ## Just want the image?
 
