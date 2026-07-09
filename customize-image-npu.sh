@@ -110,6 +110,44 @@ sed -i 's@^\(\s*\)args->value = regulator_get_voltage(rknpu_dev->vdd);@\1args->v
 grep -q 'rknpu_dev->vdd ? regulator_get_voltage' /usr/src/rknpu-0.9.8/src/rknpu_drv.c \
     || { echo "ERROR: RKNPU_GET_VOLT NULL-guard patch did not apply" >&2; exit 1; }
 
+# Patch rknpu_drv.c: the batched-ioctl wrapper clobbers MEM_CREATE's results.
+# w568w's misc ioctl handler copies user args into a local `kdata` union,
+# dispatches, then unconditionally copies kdata back on any _IOC_READ ioctl.
+# But the RKNPU_MEM_* handlers take the raw user pointer and write their own
+# results (obj_addr / dma_addr) directly — so the blanket copy-back then
+# overwrites them with the stale *input* snapshot (obj_addr=0, dma_addr=0).
+# librknnrt consequently issues RKNPU_MEM_SYNC with obj_addr=0 and
+# RKNPU_SUBMIT with task_obj_addr=0, both -> EINVAL, and NO model can run.
+# Restrict the copy-back to the only two handlers actually dispatched via
+# &kdata (ACTION and SUBMIT). Verified: mobilenet inference goes from
+# 0 (EINVAL) to ~111 inferences/s after this.
+python3 <<'PYPATCH'
+path = "/usr/src/rknpu-0.9.8/src/rknpu_drv.c"
+with open(path) as f:
+    src = f.read()
+old = "\tif (ret == 0 && (dir & _IOC_READ)) {\n"
+new = ("\tif (ret == 0 && (dir & _IOC_READ) &&\n"
+       "\t    (_IOC_NR(cmd) == RKNPU_ACTION || _IOC_NR(cmd) == RKNPU_SUBMIT)) {\n")
+if old not in src:
+    raise SystemExit("ERROR: rknpu_drv.c ioctl copy-back block not found — upstream changed?")
+with open(path, "w") as f:
+    f.write(src.replace(old, new, 1))
+print("patched rknpu_drv.c: ioctl copy-back restricted to ACTION/SUBMIT")
+PYPATCH
+
+# Patch rknpu_drv.c: clamp the RK3588 config core_mask from 0x7 (all three
+# cores) to 0x1 (core 0 only). The DT overlay below binds the NPU to a single
+# IOMMU (rknn_mmu_0) — mainline rockchip-iommu's of_xlate is last-wins, so a
+# node listing three iommus leaves cores 1/2 on a *bypassed* MMU that emits
+# IOVAs as raw physical addresses (memory-corruption risk). Advertising only
+# core 0 keeps every path safe. Multi-core needs a single iommu node with
+# three reg banks — tracked as a follow-up. Only rk3588 uses 0x7, so this
+# sed is unambiguous.
+sed -i 's@^\(\s*\)\.core_mask = 0x7,@\1.core_mask = 0x1, /* single-IOMMU DT: core0 only */@' \
+    /usr/src/rknpu-0.9.8/src/rknpu_drv.c
+grep -q '\.core_mask = 0x1, /\* single-IOMMU' /usr/src/rknpu-0.9.8/src/rknpu_drv.c \
+    || { echo "ERROR: rk3588 core_mask clamp did not apply" >&2; exit 1; }
+
 # Patch rknpu_drv.c: probe() bails with -ENOMEM if rk_dma_heap_find
 # returns NULL for "rk-dma-heap-cma" (the BSP-only heap doesn't exist
 # on mainline, so our stub always returns NULL — the driver never
@@ -327,7 +365,15 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
          * (rknpu_drv.c) using the strings "npu0"/"npu1"/"npu2". */
         power-domain-names = "npu0", "npu1", "npu2";
 
-        iommus = <&rknn_mmu_0>, <&rknn_mmu_1>, <&rknn_mmu_2>;
+        /* Single IOMMU only. Mainline rockchip-iommu's of_xlate is
+         * last-wins: a node listing three iommus binds the device to the
+         * LAST one (core2's MMU) and leaves cores 0/1 on a bypassed MMU
+         * that emits IOVAs as raw physical addresses — the NPU then reads
+         * garbage, jobs time out, and stray DMA can corrupt memory. Bind
+         * to core0's MMU only; the driver's core_mask is clamped to 0x1 to
+         * match (see rknpu_drv.c patch above). True multi-core needs a
+         * single iommu node with three reg banks — tracked as a follow-up. */
+        iommus = <&rknn_mmu_0>;
 
         npu-supply = <&vdd_npu_s0>;
         sram-supply = <&vdd_npu_s0>;
