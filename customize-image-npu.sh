@@ -95,6 +95,59 @@ install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/rknpu_mem.c \
 # is a known upstream w568w gap that Talos patches similarly.
 sed -i 's/rknpu_dev->fake_dev/rknpu_dev->dev/g' /usr/src/rknpu-0.9.8/src/rknpu_gem.c
 
+# Patch rknpu_drv.c: the RKNPU_GET_VOLT ioctl derefs rknpu_dev->vdd without
+# a NULL check, which oopses the kernel on this board. probe() acquires the
+# supply with devm_regulator_get_optional(dev, "rknpu") — that looks for a DT
+# property named `rknpu-supply`, but the mainline rk3588s DT names it
+# `npu-supply`. The lookup returns -ENODEV, probe() sets ->vdd = NULL and
+# carries on (it's an *optional* regulator), and then the ioctl handler
+# dereferences it. Every other consumer of ->vdd guards with `if
+# (rknpu_dev->vdd)`; only the ioctl path doesn't. Any process that can open
+# /dev/rknpu can panic the kernel with a single ioctl, so this must land
+# alongside the udev rule below that opens the node up to the render group.
+sed -i 's@^\(\s*\)args->value = regulator_get_voltage(rknpu_dev->vdd);@\1args->value = rknpu_dev->vdd ? regulator_get_voltage(rknpu_dev->vdd) : 0;@' \
+    /usr/src/rknpu-0.9.8/src/rknpu_drv.c
+grep -q 'rknpu_dev->vdd ? regulator_get_voltage' /usr/src/rknpu-0.9.8/src/rknpu_drv.c \
+    || { echo "ERROR: RKNPU_GET_VOLT NULL-guard patch did not apply" >&2; exit 1; }
+
+# Patch rknpu_drv.c: the batched-ioctl wrapper clobbers MEM_CREATE's results.
+# w568w's misc ioctl handler copies user args into a local `kdata` union,
+# dispatches, then unconditionally copies kdata back on any _IOC_READ ioctl.
+# But the RKNPU_MEM_* handlers take the raw user pointer and write their own
+# results (obj_addr / dma_addr) directly — so the blanket copy-back then
+# overwrites them with the stale *input* snapshot (obj_addr=0, dma_addr=0).
+# librknnrt consequently issues RKNPU_MEM_SYNC with obj_addr=0 and
+# RKNPU_SUBMIT with task_obj_addr=0, both -> EINVAL, and NO model can run.
+# Restrict the copy-back to the only two handlers actually dispatched via
+# &kdata (ACTION and SUBMIT). Verified: mobilenet inference goes from
+# 0 (EINVAL) to ~111 inferences/s after this.
+python3 <<'PYPATCH'
+path = "/usr/src/rknpu-0.9.8/src/rknpu_drv.c"
+with open(path) as f:
+    src = f.read()
+old = "\tif (ret == 0 && (dir & _IOC_READ)) {\n"
+new = ("\tif (ret == 0 && (dir & _IOC_READ) &&\n"
+       "\t    (_IOC_NR(cmd) == RKNPU_ACTION || _IOC_NR(cmd) == RKNPU_SUBMIT)) {\n")
+if old not in src:
+    raise SystemExit("ERROR: rknpu_drv.c ioctl copy-back block not found — upstream changed?")
+with open(path, "w") as f:
+    f.write(src.replace(old, new, 1))
+print("patched rknpu_drv.c: ioctl copy-back restricted to ACTION/SUBMIT")
+PYPATCH
+
+# Patch rknpu_drv.c: clamp the RK3588 config core_mask from 0x7 (all three
+# cores) to 0x1 (core 0 only). The DT overlay below binds the NPU to a single
+# IOMMU (rknn_mmu_0) — mainline rockchip-iommu's of_xlate is last-wins, so a
+# node listing three iommus leaves cores 1/2 on a *bypassed* MMU that emits
+# IOVAs as raw physical addresses (memory-corruption risk). Advertising only
+# core 0 keeps every path safe. Multi-core needs a single iommu node with
+# three reg banks — tracked as a follow-up. Only rk3588 uses 0x7, so this
+# sed is unambiguous.
+sed -i 's@^\(\s*\)\.core_mask = 0x7,@\1.core_mask = 0x1, /* single-IOMMU DT: core0 only */@' \
+    /usr/src/rknpu-0.9.8/src/rknpu_drv.c
+grep -q '\.core_mask = 0x1, /\* single-IOMMU' /usr/src/rknpu-0.9.8/src/rknpu_drv.c \
+    || { echo "ERROR: rk3588 core_mask clamp did not apply" >&2; exit 1; }
+
 # Patch rknpu_drv.c: probe() bails with -ENOMEM if rk_dma_heap_find
 # returns NULL for "rk-dma-heap-cma" (the BSP-only heap doesn't exist
 # on mainline, so our stub always returns NULL — the driver never
@@ -287,8 +340,23 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
          * (rknpu_drv.c — irqs[].name = "npu0_irq" for multi-core RK3588). */
         interrupt-names = "npu0_irq", "npu1_irq", "npu2_irq";
 
-        clocks = <&scmi_clk SCMI_CLK_NPU>;
-        clock-names = "clk_npu";
+        /* clk_npu (SCMI) is the NPU compute clock, but each core's
+         * register interface is clocked by aclk_npuN/hclk_npuN — and on
+         * mainline those clocks belong to the *iommu* nodes, not the NPU
+         * node. devm_clk_bulk_get_all() on this node therefore only grabbed
+         * clk_npu, leaving the bus clocks to gate whenever the per-core
+         * iommu was runtime-suspended. Result: reads of the core register
+         * block (e.g. the HW-version register at offset 0) returned 0, so
+         * librknnrt misdetected the SoC as RK3566/68 and refused to load any
+         * RK3588 model. Listing the six bus clocks here makes power_on's
+         * clk_bulk_prepare_enable() hold them on for the whole powered
+         * window. clk_npu must stay first — the driver reports FREQ from
+         * clks[0]. */
+        clocks = <&scmi_clk SCMI_CLK_NPU>,
+                 <&cru ACLK_NPU0>, <&cru ACLK_NPU1>, <&cru ACLK_NPU2>,
+                 <&cru HCLK_NPU0>, <&cru HCLK_NPU1>, <&cru HCLK_NPU2>;
+        clock-names = "clk_npu", "aclk0", "aclk1", "aclk2",
+                      "hclk0", "hclk1", "hclk2";
 
         power-domains = <&power RK3588_PD_NPUTOP>,
                         <&power RK3588_PD_NPU1>,
@@ -297,7 +365,15 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
          * (rknpu_drv.c) using the strings "npu0"/"npu1"/"npu2". */
         power-domain-names = "npu0", "npu1", "npu2";
 
-        iommus = <&rknn_mmu_0>, <&rknn_mmu_1>, <&rknn_mmu_2>;
+        /* Single IOMMU only. Mainline rockchip-iommu's of_xlate is
+         * last-wins: a node listing three iommus binds the device to the
+         * LAST one (core2's MMU) and leaves cores 0/1 on a bypassed MMU
+         * that emits IOVAs as raw physical addresses — the NPU then reads
+         * garbage, jobs time out, and stray DMA can corrupt memory. Bind
+         * to core0's MMU only; the driver's core_mask is clamped to 0x1 to
+         * match (see rknpu_drv.c patch above). True multi-core needs a
+         * single iommu node with three reg banks — tracked as a follow-up. */
+        iommus = <&rknn_mmu_0>;
 
         npu-supply = <&vdd_npu_s0>;
         sram-supply = <&vdd_npu_s0>;
@@ -370,6 +446,20 @@ BLACK
 
 echo "rknpu" > /etc/modules-load.d/orangepi-rknpu.conf
 
+# misc_register() creates /dev/rknpu as 0600 root:root, so librknnrt.so
+# (which opens /dev/rknpu by name) gets EACCES for any non-root caller.
+# Hand it to the render group — Armbian already puts the first user in
+# both video and render.
+# librknnrt also allocates NPU buffers from the mainline DMA-BUF heaps
+# (it opens /dev/dma_heap/system directly), and those nodes are likewise
+# created 0600 root:root. Hand the heaps to render too, else non-root
+# inference dies at "Failed to open DMA heap: /dev/dma_heap/system".
+cat > /etc/udev/rules.d/99-rknpu.rules <<'UDEV'
+KERNEL=="rknpu", MODE="0660", GROUP="render"
+SUBSYSTEM=="dma_heap", MODE="0660", GROUP="render"
+UDEV
+chmod 0644 /etc/udev/rules.d/99-rknpu.rules
+
 # --- 6. librknnrt.so userspace runtime ---
 # v2.3.2 (April 2025) from airockchip/rknn-toolkit2. Stable across 2.x.x
 # releases, ABI-compatible with rknpu module 0.9.8/0.9.10.
@@ -378,5 +468,35 @@ curl -fsSL --retry 3 \
     -o /usr/lib/librknnrt.so
 chmod 0644 /usr/lib/librknnrt.so
 ldconfig
+
+# --- 7. rknn_server (connected-mode inference / RKNN-Toolkit2 profiling) ---
+# Lets a host PC run/profile models on this board over adb/network via
+# RKNN-Toolkit2. Shipped but NOT auto-started (it's a dev/debug tool).
+for f in rknn_server start_rknn.sh restart_rknn.sh; do
+    curl -fsSL --retry 3 \
+        "https://github.com/airockchip/rknn-toolkit2/raw/v2.3.2/rknpu2/runtime/Linux/rknn_server/aarch64/usr/bin/$f" \
+        -o "/usr/bin/$f" && chmod 0755 "/usr/bin/$f" \
+        || echo "WARN: failed to fetch $f"
+done
+
+# --- 8. NPU benchmark + sample model (orangepi-npu-benchmark) ---
+# Dependency-free throughput probe: loads librknnrt + a MobileNet v1 model,
+# runs N inferences on zeroed input, reports latency/throughput. Also the
+# quickest way to confirm the NPU runtime path end to end.
+mkdir -p /usr/local/share/rknn-benchmark
+curl -fsSL --retry 3 \
+    https://github.com/airockchip/rknn-toolkit2/raw/v2.3.2/rknpu2/examples/rknn_mobilenet_demo/model/RK3588/mobilenet_v1.rknn \
+    -o /usr/local/share/rknn-benchmark/mobilenet_v1.rknn
+curl -fsSL --retry 3 \
+    https://github.com/airockchip/rknn-toolkit2/raw/v2.3.2/rknpu2/runtime/Linux/librknn_api/include/rknn_api.h \
+    -o /tmp/rknn_api.h
+install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/npu_benchmark.c /tmp/npu_benchmark.c
+if gcc -O2 -I/tmp -o /usr/local/bin/orangepi-npu-benchmark /tmp/npu_benchmark.c -lrknnrt -lm; then
+    chmod 0755 /usr/local/bin/orangepi-npu-benchmark
+    echo "NPU benchmark installed: orangepi-npu-benchmark"
+else
+    echo "WARN: orangepi-npu-benchmark failed to compile"
+fi
+rm -f /tmp/npu_benchmark.c /tmp/rknn_api.h
 
 echo "RKNPU stack installed: DKMS module 0.9.8, librknnrt 2.3.2, overlay rk3588-rknpu-opi5pro."

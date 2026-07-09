@@ -21,8 +21,11 @@ export DEBIAN_FRONTEND=noninteractive
 # include xwayland / xserver-xorg-core that KWin-Wayland and any X11 desktop
 # session need. Without them: SDDM greeter shows but user sessions blank.
 apt-get update
+# mesa-vulkan-drivers ships the PanVK ICD (/usr/share/vulkan/icd.d) — without
+# it vulkan-tools is present but every Vulkan app fails "no ICD". PanVK gives
+# the Mali-G610 a working Vulkan 1.x driver on the panthor kernel stack.
 apt-get install -y \
-    kubuntu-desktop konsole mesa-utils vulkan-tools \
+    kubuntu-desktop konsole mesa-utils vulkan-tools mesa-vulkan-drivers \
     xserver-xorg-core xwayland \
     git ca-certificates curl
 
