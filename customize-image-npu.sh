@@ -302,8 +302,23 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
          * (rknpu_drv.c — irqs[].name = "npu0_irq" for multi-core RK3588). */
         interrupt-names = "npu0_irq", "npu1_irq", "npu2_irq";
 
-        clocks = <&scmi_clk SCMI_CLK_NPU>;
-        clock-names = "clk_npu";
+        /* clk_npu (SCMI) is the NPU compute clock, but each core's
+         * register interface is clocked by aclk_npuN/hclk_npuN — and on
+         * mainline those clocks belong to the *iommu* nodes, not the NPU
+         * node. devm_clk_bulk_get_all() on this node therefore only grabbed
+         * clk_npu, leaving the bus clocks to gate whenever the per-core
+         * iommu was runtime-suspended. Result: reads of the core register
+         * block (e.g. the HW-version register at offset 0) returned 0, so
+         * librknnrt misdetected the SoC as RK3566/68 and refused to load any
+         * RK3588 model. Listing the six bus clocks here makes power_on's
+         * clk_bulk_prepare_enable() hold them on for the whole powered
+         * window. clk_npu must stay first — the driver reports FREQ from
+         * clks[0]. */
+        clocks = <&scmi_clk SCMI_CLK_NPU>,
+                 <&cru ACLK_NPU0>, <&cru ACLK_NPU1>, <&cru ACLK_NPU2>,
+                 <&cru HCLK_NPU0>, <&cru HCLK_NPU1>, <&cru HCLK_NPU2>;
+        clock-names = "clk_npu", "aclk0", "aclk1", "aclk2",
+                      "hclk0", "hclk1", "hclk2";
 
         power-domains = <&power RK3588_PD_NPUTOP>,
                         <&power RK3588_PD_NPU1>,
