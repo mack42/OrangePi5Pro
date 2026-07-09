@@ -95,6 +95,21 @@ install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/rknpu_mem.c \
 # is a known upstream w568w gap that Talos patches similarly.
 sed -i 's/rknpu_dev->fake_dev/rknpu_dev->dev/g' /usr/src/rknpu-0.9.8/src/rknpu_gem.c
 
+# Patch rknpu_drv.c: the RKNPU_GET_VOLT ioctl derefs rknpu_dev->vdd without
+# a NULL check, which oopses the kernel on this board. probe() acquires the
+# supply with devm_regulator_get_optional(dev, "rknpu") — that looks for a DT
+# property named `rknpu-supply`, but the mainline rk3588s DT names it
+# `npu-supply`. The lookup returns -ENODEV, probe() sets ->vdd = NULL and
+# carries on (it's an *optional* regulator), and then the ioctl handler
+# dereferences it. Every other consumer of ->vdd guards with `if
+# (rknpu_dev->vdd)`; only the ioctl path doesn't. Any process that can open
+# /dev/rknpu can panic the kernel with a single ioctl, so this must land
+# alongside the udev rule below that opens the node up to the render group.
+sed -i 's@^\(\s*\)args->value = regulator_get_voltage(rknpu_dev->vdd);@\1args->value = rknpu_dev->vdd ? regulator_get_voltage(rknpu_dev->vdd) : 0;@' \
+    /usr/src/rknpu-0.9.8/src/rknpu_drv.c
+grep -q 'rknpu_dev->vdd ? regulator_get_voltage' /usr/src/rknpu-0.9.8/src/rknpu_drv.c \
+    || { echo "ERROR: RKNPU_GET_VOLT NULL-guard patch did not apply" >&2; exit 1; }
+
 # Patch rknpu_drv.c: probe() bails with -ENOMEM if rk_dma_heap_find
 # returns NULL for "rk-dma-heap-cma" (the BSP-only heap doesn't exist
 # on mainline, so our stub always returns NULL — the driver never
