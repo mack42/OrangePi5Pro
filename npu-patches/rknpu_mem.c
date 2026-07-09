@@ -251,6 +251,8 @@
 
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
+#include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
 #include <linux/dma-mapping.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
@@ -317,7 +319,135 @@ struct rknpu_mem_buf {
 	struct sg_table		 sgt;		/* scatter-gather (small path only) */
 	struct page		**pages;	/* physical pages (both paths) */
 	unsigned long		 nr_pages;	/* number of pages (both paths) */
+	struct iosys_map	 vmap_map;	/* dma_buf_vmap map (import path) */
 };
+
+/*
+ * Bug 56: dma-buf IMPORT path.
+ *
+ * librknnrt 2.3.x in DMA_HEAP mode allocates external buffers (model
+ * weights, task/command buffers, tensor I/O) itself via
+ * /dev/dma_heap/system (DMA_HEAP_IOCTL_ALLOC -> dma-buf fd), then calls
+ * RKNPU_MEM_CREATE with args.handle = that fd so the driver IMPORTS the
+ * buffer: attach + map into the NPU IOMMU, vmap for the kernel (the submit
+ * path reads task descriptors via obj->kv_addr), and return obj_addr /
+ * dma_addr.  The vendor driver does exactly this when args.handle > 0
+ * (dma_buf_get + rknpu_obj->owner = 0).  The Talos port ignored
+ * args.handle and allocated fresh zeroed pages, so the NPU only ever saw
+ * zeros -> job timeout, and librknnrt's RKNPU_MEM_SYNC failed with EINVAL.
+ */
+static int rknpu_mem_import(struct rknpu_device *rknpu_dev,
+			    struct rknpu_mem_create *args)
+{
+	struct rknpu_mem_buf *buf;
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	struct scatterlist *sg;
+	dma_addr_t expected;
+	unsigned int i;
+	int ret;
+
+	dmabuf = dma_buf_get((int)args->handle);
+	if (IS_ERR(dmabuf)) {
+		LOG_DEV_ERROR(rknpu_dev->dev,
+			      "mem_import: dma_buf_get(%u) failed: %ld\n",
+			      args->handle, PTR_ERR(dmabuf));
+		return PTR_ERR(dmabuf);
+	}
+
+	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto err_put;
+	}
+	buf->dev = rknpu_dev->dev;
+
+	attach = dma_buf_attach(dmabuf, rknpu_dev->dev);
+	if (IS_ERR(attach)) {
+		ret = PTR_ERR(attach);
+		LOG_DEV_ERROR(rknpu_dev->dev,
+			      "mem_import: dma_buf_attach failed: %d\n", ret);
+		goto err_free;
+	}
+
+	sgt = dma_buf_map_attachment_unlocked(attach, DMA_BIDIRECTIONAL);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		LOG_DEV_ERROR(rknpu_dev->dev,
+			      "mem_import: dma_buf_map_attachment failed: %d\n",
+			      ret);
+		goto err_detach;
+	}
+
+	/*
+	 * The NPU accesses each buffer as a flat [dma_addr, dma_addr+size)
+	 * range.  iommu_dma_map_sg maps the whole scatterlist into one
+	 * contiguous IOVA allocation, so this should always hold; verify
+	 * and fail loudly rather than let the NPU wander off the mapping.
+	 */
+	expected = sg_dma_address(sgt->sgl);
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		if (sg_dma_len(sg) == 0)
+			continue;
+		if (sg_dma_address(sg) != expected) {
+			LOG_DEV_ERROR(rknpu_dev->dev,
+				      "mem_import: non-contiguous IOVA (ent %u: %pad != %pad)\n",
+				      i, &sg->dma_address, &expected);
+			ret = -EINVAL;
+			goto err_unmap;
+		}
+		expected += sg_dma_len(sg);
+	}
+
+	ret = dma_buf_vmap_unlocked(dmabuf, &buf->vmap_map);
+	if (ret) {
+		LOG_DEV_ERROR(rknpu_dev->dev,
+			      "mem_import: dma_buf_vmap failed: %d\n", ret);
+		goto err_unmap;
+	}
+
+	buf->mem.kv_addr    = buf->vmap_map.vaddr;
+	buf->mem.dma_addr   = sg_dma_address(sgt->sgl);
+	buf->mem.size       = dmabuf->size;
+	buf->mem.flags      = args->flags;
+	buf->mem.dmabuf     = dmabuf;
+	buf->mem.attachment = attach;
+	buf->mem.sgt        = sgt;
+	buf->mem.owner      = 0;
+
+	args->obj_addr = (__u64)(uintptr_t)&buf->mem;
+	args->dma_addr = buf->mem.dma_addr;
+	args->size     = buf->mem.size;
+	/* keep args->handle as passed in: librknnrt owns that fd */
+	args->iommu_domain_id = 0;	/* see Bug 55 rev 8 */
+
+	LOG_DEV_INFO(rknpu_dev->dev,
+		     "mem_import: fd=%u size=%zu dma_addr=%pad nents=%u obj=%px kv=%px\n",
+		     args->handle, buf->mem.size, &buf->mem.dma_addr,
+		     sgt->nents, &buf->mem, buf->mem.kv_addr);
+	return 0;
+
+err_unmap:
+	dma_buf_unmap_attachment_unlocked(attach, sgt, DMA_BIDIRECTIONAL);
+err_detach:
+	dma_buf_detach(dmabuf, attach);
+err_free:
+	kfree(buf);
+err_put:
+	dma_buf_put(dmabuf);
+	return ret;
+}
+
+static void rknpu_mem_import_release(struct rknpu_mem_buf *buf)
+{
+	dma_buf_vunmap_unlocked(buf->mem.dmabuf, &buf->vmap_map);
+	dma_buf_unmap_attachment_unlocked(buf->mem.attachment, buf->mem.sgt,
+					  DMA_BIDIRECTIONAL);
+	dma_buf_detach(buf->mem.dmabuf, buf->mem.attachment);
+	dma_buf_put(buf->mem.dmabuf);
+	kfree(buf);
+}
 
 static int rknpu_mem_obj_mmap(struct file *filp, struct vm_area_struct *vma)
 {
@@ -377,6 +507,21 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 
 	if (copy_from_user(&args, (void __user *)data, sizeof(args)))
 		return -EFAULT;
+
+	LOG_DEV_DEBUG(rknpu_dev->dev,
+		      "mem_create: handle=%u flags=%#x size=%llu sram=%llu domain=%d core_mask=%#x\n",
+		      args.handle, args.flags, args.size, args.sram_size,
+		      args.iommu_domain_id, args.core_mask);
+
+	/* Bug 56: handle != 0 means "import this dma-buf fd", not "allocate". */
+	if (args.handle) {
+		ret = rknpu_mem_import(rknpu_dev, &args);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)data, &args, sizeof(args)))
+			return -EFAULT;
+		return 0;
+	}
 
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
@@ -643,11 +788,29 @@ err_free_pages:
 int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 			    unsigned long data)
 {
+	struct rknpu_mem_destroy args;
+	struct rknpu_mem_buf *buf;
+
+	if (copy_from_user(&args, (void __user *)data, sizeof(args)))
+		return -EFAULT;
+
+	LOG_DEV_DEBUG(rknpu_dev->dev, "mem_destroy: handle=%u obj=%#llx\n",
+		      args.handle, args.obj_addr);
+
+	if (!args.obj_addr)
+		return 0;
+
+	buf = (struct rknpu_mem_buf *)(uintptr_t)args.obj_addr;
+
 	/*
-	 * Memory lifetime is tied to the fd returned by rknpu_mem_create_ioctl.
-	 * Closing the fd triggers rknpu_mem_obj_release → DMA teardown.
-	 * No explicit destroy action is needed here.
+	 * Bug 56: imported dma-bufs have no anon fd; tear them down here.
+	 * Driver-allocated buffers (mem.dmabuf == NULL) are freed when
+	 * librknnrt closes the anon fd (rknpu_mem_obj_release) — do NOT
+	 * free them here or we double-free.
 	 */
+	if (buf->mem.dmabuf)
+		rknpu_mem_import_release(buf);
+
 	return 0;
 }
 
@@ -660,8 +823,12 @@ int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
 	if (copy_from_user(&args, (void __user *)data, sizeof(args)))
 		return -EFAULT;
 
-	if (!args.obj_addr)
+	if (!args.obj_addr) {
+		LOG_DEV_ERROR(rknpu_dev->dev,
+			      "mem_sync: obj_addr=0 (flags=%#x offset=%llu size=%llu) -> EINVAL\n",
+			      args.flags, args.offset, args.size);
 		return -EINVAL;
+	}
 
 	/*
 	 * obj_addr is &buf->mem (filled by rknpu_mem_create_ioctl).
@@ -670,7 +837,18 @@ int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
 	 */
 	buf = (struct rknpu_mem_buf *)(uintptr_t)args.obj_addr;
 
-	if (buf->use_iommu_map) {
+	if (buf->mem.dmabuf) {
+		/*
+		 * Bug 56: imported dma-buf.  Delegate cache maintenance to
+		 * the exporting heap (system heap syncs every attachment's
+		 * DMA mapping, which includes ours).
+		 */
+		if (args.flags & RKNPU_MEM_SYNC_TO_DEVICE)
+			dma_buf_end_cpu_access(buf->mem.dmabuf, DMA_TO_DEVICE);
+		if (args.flags & RKNPU_MEM_SYNC_FROM_DEVICE)
+			dma_buf_begin_cpu_access(buf->mem.dmabuf,
+						 DMA_FROM_DEVICE);
+	} else if (buf->use_iommu_map) {
 		/*
 		 * Large-path: pages were mapped via iommu_map(), bypassing the
 		 * DMA subsystem.  The Rockchip IOMMU does not participate in
