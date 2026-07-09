@@ -370,6 +370,15 @@ BLACK
 
 echo "rknpu" > /etc/modules-load.d/orangepi-rknpu.conf
 
+# misc_register() creates /dev/rknpu as 0600 root:root, so librknnrt.so
+# (which opens /dev/rknpu by name) gets EACCES for any non-root caller.
+# Hand it to the render group — Armbian already puts the first user in
+# both video and render.
+cat > /etc/udev/rules.d/99-rknpu.rules <<'UDEV'
+KERNEL=="rknpu", MODE="0660", GROUP="render"
+UDEV
+chmod 0644 /etc/udev/rules.d/99-rknpu.rules
+
 # --- 6. librknnrt.so userspace runtime ---
 # v2.3.2 (April 2025) from airockchip/rknn-toolkit2. Stable across 2.x.x
 # releases, ABI-compatible with rknpu module 0.9.8/0.9.10.
