@@ -404,8 +404,13 @@ echo "rknpu" > /etc/modules-load.d/orangepi-rknpu.conf
 # (which opens /dev/rknpu by name) gets EACCES for any non-root caller.
 # Hand it to the render group — Armbian already puts the first user in
 # both video and render.
+# librknnrt also allocates NPU buffers from the mainline DMA-BUF heaps
+# (it opens /dev/dma_heap/system directly), and those nodes are likewise
+# created 0600 root:root. Hand the heaps to render too, else non-root
+# inference dies at "Failed to open DMA heap: /dev/dma_heap/system".
 cat > /etc/udev/rules.d/99-rknpu.rules <<'UDEV'
 KERNEL=="rknpu", MODE="0660", GROUP="render"
+SUBSYSTEM=="dma_heap", MODE="0660", GROUP="render"
 UDEV
 chmod 0644 /etc/udev/rules.d/99-rknpu.rules
 
@@ -417,5 +422,35 @@ curl -fsSL --retry 3 \
     -o /usr/lib/librknnrt.so
 chmod 0644 /usr/lib/librknnrt.so
 ldconfig
+
+# --- 7. rknn_server (connected-mode inference / RKNN-Toolkit2 profiling) ---
+# Lets a host PC run/profile models on this board over adb/network via
+# RKNN-Toolkit2. Shipped but NOT auto-started (it's a dev/debug tool).
+for f in rknn_server start_rknn.sh restart_rknn.sh; do
+    curl -fsSL --retry 3 \
+        "https://github.com/airockchip/rknn-toolkit2/raw/v2.3.2/rknpu2/runtime/Linux/rknn_server/aarch64/usr/bin/$f" \
+        -o "/usr/bin/$f" && chmod 0755 "/usr/bin/$f" \
+        || echo "WARN: failed to fetch $f"
+done
+
+# --- 8. NPU benchmark + sample model (orangepi-npu-benchmark) ---
+# Dependency-free throughput probe: loads librknnrt + a MobileNet v1 model,
+# runs N inferences on zeroed input, reports latency/throughput. Also the
+# quickest way to confirm the NPU runtime path end to end.
+mkdir -p /usr/local/share/rknn-benchmark
+curl -fsSL --retry 3 \
+    https://github.com/airockchip/rknn-toolkit2/raw/v2.3.2/rknpu2/examples/rknn_mobilenet_demo/model/RK3588/mobilenet_v1.rknn \
+    -o /usr/local/share/rknn-benchmark/mobilenet_v1.rknn
+curl -fsSL --retry 3 \
+    https://github.com/airockchip/rknn-toolkit2/raw/v2.3.2/rknpu2/runtime/Linux/librknn_api/include/rknn_api.h \
+    -o /tmp/rknn_api.h
+install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/npu_benchmark.c /tmp/npu_benchmark.c
+if gcc -O2 -I/tmp -o /usr/local/bin/orangepi-npu-benchmark /tmp/npu_benchmark.c -lrknnrt -lm; then
+    chmod 0755 /usr/local/bin/orangepi-npu-benchmark
+    echo "NPU benchmark installed: orangepi-npu-benchmark"
+else
+    echo "WARN: orangepi-npu-benchmark failed to compile"
+fi
+rm -f /tmp/npu_benchmark.c /tmp/rknn_api.h
 
 echo "RKNPU stack installed: DKMS module 0.9.8, librknnrt 2.3.2, overlay rk3588-rknpu-opi5pro."
