@@ -65,6 +65,26 @@ fi
 # Apply the rust-coreutils chroot-panic workaround (idempotent).
 FRAMEWORK_DIR="${WORK}/framework" "${script_dir}/apply-uutils-shim.sh"
 
+# Work around two bugs in current Armbian framework (>= 26.08-trunk) that
+# abort our build. Both are idempotent. Remove once upstream fixes land.
+#
+#   1. A debug-only `run_host_command_logged ls -lahtR <apt-dir>` aborts the
+#      whole build: modern apt creates a lists/auxfiles subdir that makes
+#      `ls -R` print "not listing already-listed directory" and exit 2, and
+#      run_host_command_logged treats any non-zero as fatal. Drop the -R so
+#      the (non-recursive) diagnostic can't fail. Two copies exist.
+#   2. extensions/armbian-config.sh auto-installs armbian-config in a
+#      post-customize hook; that install fails against the current configng
+#      repo and it's not needed for our image. Make the hook a no-op.
+fw="${WORK}/framework"
+sed -i 's@\(run_host_command_logged \)ls -lahtR@\1ls -laht@g' \
+    "${fw}/lib/functions/host/host-utils.sh" \
+    "${fw}/lib/functions/rootfs/apt-install.sh"
+if ! grep -q 'armbian-config install skipped' "${fw}/extensions/armbian-config.sh" 2>/dev/null; then
+    perl -0pi -e 's/(function post_armbian_repo_customize_image__install_armbian-config\(\) \{\n)\tchroot_sdcard_apt_get_install "armbian-config"\n/$1\t# armbian-config install skipped (custom image; install fails vs configng repo)\n\treturn 0\n/' \
+        "${fw}/extensions/armbian-config.sh"
+fi
+
 # Note: Armbian's framework doesn't yet have resolute desktop environment
 # configs (only bookworm / noble / jammy do as of May 2026), so --desktop
 # can't go through BUILD_DESKTOP=yes (errors with "kde-plasma does not exist
@@ -103,7 +123,14 @@ cd "${WORK}/framework"
 # the rk3588-rknpu DT overlay against dt-bindings/. Without this flag,
 # Armbian only installs the linux-image deb and customize-image runs
 # without headers available.
-exec ./compile.sh \
+# Marker so we can find the image THIS run produces. Armbian names every
+# image *_minimal (we pass BUILD_MINIMAL=yes; the desktop content comes from
+# our customize hook, which the framework's naming can't see), so we rename
+# it below to reflect the real variant.
+build_marker="$(mktemp)"
+
+# Not exec'd — we post-process (rename) the output after the build returns.
+./compile.sh \
     BOARD=orangepi5pro \
     BRANCH="$BRANCH" \
     RELEASE=resolute \
@@ -113,3 +140,21 @@ exec ./compile.sh \
     INSTALL_HEADERS=yes \
     COMPRESS_OUTPUTIMAGE=sha,xz \
     EXPERT=yes
+
+# Rename to a short, correctly-labelled artifact:
+#   opi5pro[-$VERSION]-{desktop,minimal}.img.xz  (+ regenerated .sha256, + .img.txt)
+# Set VERSION=v1.7.0 (etc.) in the environment to embed a release tag.
+imgdir="${WORK}/framework/output/images"
+newimg="$(find "$imgdir" -maxdepth 1 -name 'Armbian-unofficial_*_minimal.img.xz' -newer "$build_marker" 2>/dev/null | head -1)"
+rm -f "$build_marker"
+if [[ -n "$newimg" ]]; then
+    variant="minimal"; [[ "$DESKTOP" == "yes" ]] && variant="desktop"
+    base="opi5pro${VERSION:+-${VERSION}}-${variant}"
+    mv -f "$newimg" "${imgdir}/${base}.img.xz"
+    [[ -f "${newimg%.img.xz}.img.txt" ]] && mv -f "${newimg%.img.xz}.img.txt" "${imgdir}/${base}.img.txt"
+    rm -f "${newimg}.sha"   # stale: references the old filename
+    ( cd "$imgdir" && sha256sum "${base}.img.xz" > "${base}.img.xz.sha256" )
+    echo ">>> Image ready: ${imgdir}/${base}.img.xz"
+else
+    echo ">>> WARN: build finished but no fresh image found to rename in ${imgdir}" >&2
+fi
