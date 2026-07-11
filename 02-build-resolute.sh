@@ -7,7 +7,9 @@
 # Usage:
 #   ./02-build-resolute.sh                  # minimal CLI image (default)
 #   ./02-build-resolute.sh --desktop        # with KDE Plasma + SDDM
-#   DESKTOP=yes ./02-build-resolute.sh      # same via env var
+#   ./02-build-resolute.sh --both           # both images (minimal, then desktop)
+#   VERSION=v1.8.0 ./02-build-resolute.sh --both   # both, release-named
+#   DESKTOP=yes ./02-build-resolute.sh      # same as --desktop via env var
 #   BRANCH=vendor ./02-build-resolute.sh    # use Rockchip BSP (no GPU accel — see issue #1)
 #
 # Defaults to BRANCH=current (mainline ~6.18 kernel) for working GPU
@@ -24,12 +26,14 @@
 set -euo pipefail
 
 DESKTOP="${DESKTOP:-no}"
+BOTH="${BOTH:-no}"
 BRANCH="${BRANCH:-current}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --desktop)    DESKTOP=yes; shift ;;
         --no-desktop) DESKTOP=no; shift ;;
+        --both)       BOTH=yes; shift ;;
         --branch=*)   BRANCH="${1#*=}"; shift ;;
         -h|--help)
             sed -n '2,16p' "$0" | sed 's/^# \?//'
@@ -93,68 +97,70 @@ fi
 # inside the chroot during build.
 userpatches="${WORK}/framework/userpatches"
 mkdir -p "$userpatches"
-# Defensively drop any prior customize-image.sh before copying in the
-# desktop/minimal one — so a half-run of this script or a previous run
-# with different flags can't leak into the next build.
-rm -f "$userpatches/customize-image.sh"
-if [[ "$DESKTOP" == "yes" ]]; then
-    echo ">>> Building image with KDE Plasma + HW video decode (MPP+rockchip-vaapi) baked in."
-    echo ">>> Expect ~45-60 min and ~2 GB output."
-    echo ">>> First boot lands at TTY: armbian-firstrun runs (set root password, create user),"
-    echo ">>> then the kdialog wizard auto-launches in Plasma for NVMe / overscan / etc."
-    src="${script_dir}/customize-image.sh"
-else
-    echo ">>> Building MINIMAL image (CLI). Expect ~8-15 min and ~300 MB output."
-    echo ">>> First boot lands at TTY: armbian-firstrun runs, then motd reminds the user"
-    echo ">>> to run 'orangepi-setup' for the post-boot wizard."
-    src="${script_dir}/customize-image-minimal.sh"
-fi
-if [[ ! -f "$src" ]]; then
-    echo "ERROR: $src not found in repo." >&2
-    exit 1
-fi
-cp "$src" "$userpatches/customize-image.sh"
-chmod +x "$userpatches/customize-image.sh"
-
-cd "${WORK}/framework"
-# INSTALL_HEADERS=yes — pre-installs the kernel-headers .deb into the
-# rootfs alongside linux-image-current-rockchip64. customize-image-npu.sh
-# needs the headers to (a) DKMS-build the rknpu module and (b) compile
-# the rk3588-rknpu DT overlay against dt-bindings/. Without this flag,
-# Armbian only installs the linux-image deb and customize-image runs
-# without headers available.
-# Marker so we can find the image THIS run produces. Armbian names every
-# image *_minimal (we pass BUILD_MINIMAL=yes; the desktop content comes from
-# our customize hook, which the framework's naming can't see), so we rename
-# it below to reflect the real variant.
-build_marker="$(mktemp)"
-
-# Not exec'd — we post-process (rename) the output after the build returns.
-./compile.sh \
-    BOARD=orangepi5pro \
-    BRANCH="$BRANCH" \
-    RELEASE=resolute \
-    BUILD_MINIMAL=yes \
-    BUILD_DESKTOP=no \
-    KERNEL_CONFIGURE=no \
-    INSTALL_HEADERS=yes \
-    COMPRESS_OUTPUTIMAGE=sha,xz \
-    EXPERT=yes
-
-# Rename to a short, correctly-labelled artifact:
-#   opi5pro[-$VERSION]-{desktop,minimal}.img.xz  (+ regenerated .sha256, + .img.txt)
-# Set VERSION=v1.7.0 (etc.) in the environment to embed a release tag.
 imgdir="${WORK}/framework/output/images"
-newimg="$(find "$imgdir" -maxdepth 1 -name 'Armbian-unofficial_*_minimal.img.xz' -newer "$build_marker" 2>/dev/null | head -1)"
-rm -f "$build_marker"
-if [[ -n "$newimg" ]]; then
-    variant="minimal"; [[ "$DESKTOP" == "yes" ]] && variant="desktop"
-    base="opi5pro${VERSION:+-${VERSION}}-${variant}"
-    mv -f "$newimg" "${imgdir}/${base}.img.xz"
-    [[ -f "${newimg%.img.xz}.img.txt" ]] && mv -f "${newimg%.img.xz}.img.txt" "${imgdir}/${base}.img.txt"
-    rm -f "${newimg}.sha"   # stale: references the old filename
-    ( cd "$imgdir" && sha256sum "${base}.img.xz" > "${base}.img.xz.sha256" )
-    echo ">>> Image ready: ${imgdir}/${base}.img.xz"
+
+# build_variant <desktop:yes|no> — drop in the right customize hook, run the
+# Armbian build, and rename the output to opi5pro[-$VERSION]-{desktop,minimal}.
+# Armbian names every image *_minimal (we pass BUILD_MINIMAL=yes; the desktop
+# content comes from our customize hook, which the framework's naming can't
+# see), so we rename to reflect the real variant. INSTALL_HEADERS=yes so
+# customize-image-npu.sh can DKMS-build rknpu and compile the DT overlay.
+build_variant() {
+    local desktop="$1" src variant base build_marker newimg
+    if [[ "$desktop" == "yes" ]]; then
+        echo ">>> Building image with KDE Plasma + HW video decode (MPP+rockchip-vaapi) baked in."
+        echo ">>> Expect ~45-60 min and ~940 MB output."
+        echo ">>> First boot lands at TTY: armbian-firstrun runs (set root password, create user),"
+        echo ">>> then the kdialog wizard auto-launches in Plasma for NVMe / overscan / etc."
+        src="${script_dir}/customize-image.sh"
+        variant="desktop"
+    else
+        echo ">>> Building MINIMAL image (CLI). Expect ~8-15 min and ~440 MB output."
+        echo ">>> First boot lands at TTY: armbian-firstrun runs, then motd reminds the user"
+        echo ">>> to run 'orangepi-setup' for the post-boot wizard."
+        src="${script_dir}/customize-image-minimal.sh"
+        variant="minimal"
+    fi
+    [[ -f "$src" ]] || { echo "ERROR: $src not found in repo." >&2; exit 1; }
+
+    # Defensively drop any prior customize-image.sh so a previous run (or the
+    # other variant in a --both run) can't leak into this build.
+    rm -f "$userpatches/customize-image.sh"
+    cp "$src" "$userpatches/customize-image.sh"
+    chmod +x "$userpatches/customize-image.sh"
+
+    cd "${WORK}/framework"
+    build_marker="$(mktemp)"
+    ./compile.sh \
+        BOARD=orangepi5pro \
+        BRANCH="$BRANCH" \
+        RELEASE=resolute \
+        BUILD_MINIMAL=yes \
+        BUILD_DESKTOP=no \
+        KERNEL_CONFIGURE=no \
+        INSTALL_HEADERS=yes \
+        COMPRESS_OUTPUTIMAGE=sha,xz \
+        EXPERT=yes
+
+    # Rename to a short, correctly-labelled artifact (+ regenerated .sha256, + .img.txt).
+    # Set VERSION=v1.8.0 (etc.) in the environment to embed a release tag.
+    newimg="$(find "$imgdir" -maxdepth 1 -name 'Armbian-unofficial_*_minimal.img.xz' -newer "$build_marker" 2>/dev/null | head -1)"
+    rm -f "$build_marker"
+    if [[ -n "$newimg" ]]; then
+        base="opi5pro${VERSION:+-${VERSION}}-${variant}"
+        mv -f "$newimg" "${imgdir}/${base}.img.xz"
+        [[ -f "${newimg%.img.xz}.img.txt" ]] && mv -f "${newimg%.img.xz}.img.txt" "${imgdir}/${base}.img.txt"
+        rm -f "${newimg}.sha"   # stale: references the old filename
+        ( cd "$imgdir" && sha256sum "${base}.img.xz" > "${base}.img.xz.sha256" )
+        echo ">>> Image ready: ${imgdir}/${base}.img.xz"
+    else
+        echo ">>> WARN: build finished but no fresh ${variant} image found in ${imgdir}" >&2
+    fi
+}
+
+if [[ "$BOTH" == "yes" ]]; then
+    build_variant no    # minimal first (smaller/faster; warms the rootfs cache)
+    build_variant yes   # then desktop
 else
-    echo ">>> WARN: build finished but no fresh image found to rename in ${imgdir}" >&2
+    build_variant "$DESKTOP"
 fi
