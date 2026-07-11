@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ubuntu 26.04 on Orange Pi 5 Pro — RK3588S build recipe + prebuilt images</title>
-<meta name="description" content="Ubuntu 26.04 LTS (Resolute Raccoon) for the Orange Pi 5 Pro. Prebuilt KDE Plasma desktop and minimal images, plus the Armbian-based build recipe — mainline kernel, Mali-G610 GPU acceleration, RK3588 NPU support, and a working uutils/rustix chroot fix.">
+<meta name="description" content="Ubuntu 26.04 LTS (Resolute Raccoon) for the Orange Pi 5 Pro. Prebuilt KDE Plasma desktop and minimal images, plus the Armbian-based build recipe — mainline kernel, Mali-G610 GPU acceleration, working RK3588 NPU inference, and a working uutils/rustix chroot fix.">
 <meta name="theme-color" content="#e85d04">
 <meta name="author" content="MacK42">
 
@@ -13,7 +13,7 @@
 
 <meta property="og:type" content="website">
 <meta property="og:title" content="Ubuntu 26.04 on Orange Pi 5 Pro">
-<meta property="og:description" content="Prebuilt images and Armbian build recipe for the RK3588S — mainline kernel, working GPU, NPU support, KDE Plasma desktop.">
+<meta property="og:description" content="Prebuilt images and Armbian build recipe for the RK3588S — mainline kernel, working GPU, working NPU inference, KDE Plasma desktop.">
 <meta property="og:url" content="https://mack42.github.io/OrangePi5Pro/">
 <meta property="og:site_name" content="OrangePi5Pro">
 
@@ -513,7 +513,7 @@ footer a:hover { color: var(--accent); }
   <div class="hero-inner">
     <span class="badge">Ubuntu 26.04 LTS · Resolute Raccoon</span>
     <h1>Ubuntu 26.04 on the<br><span class="accent">Orange Pi 5 Pro</span></h1>
-    <p class="lede">Prebuilt images and the Armbian-based build recipe for the Rockchip RK3588S — mainline kernel, working Mali-G610 GPU, RK3588 NPU support, and a KDE Plasma desktop image that boots straight into a setup wizard.</p>
+    <p class="lede">Prebuilt images and the Armbian-based build recipe for the Rockchip RK3588S — mainline kernel, working Mali-G610 GPU, working RK3588 NPU inference, and a KDE Plasma desktop image that boots straight into a setup wizard.</p>
     <div class="cta">
       <a href="https://github.com/mack42/OrangePi5Pro/releases/latest" class="btn btn-primary">Download latest release</a>
       <a href="https://github.com/mack42/OrangePi5Pro" class="btn btn-secondary">View on GitHub</a>
@@ -539,8 +539,9 @@ footer a:hover { color: var(--accent); }
 <span class="prompt">root@orangepi5pro:~$</span> glxinfo -B | grep "OpenGL renderer"
 OpenGL renderer string: <span class="ok">Mali-G610 (Panfrost)</span>
 
-<span class="prompt">root@orangepi5pro:~$</span> lsmod | grep rknpu
-rknpu                  <span class="ok">98304  0</span>
+<span class="prompt">mack@orangepi5pro:~$</span> orangepi-npu-benchmark
+npu driver    : 0.9.8
+throughput    : <span class="ok">110.4 inferences/s</span>
 
 <span class="prompt">root@orangepi5pro:~$</span> orangepi-setup
 <span class="cmt">+----------------------------------------------------------+
@@ -563,12 +564,12 @@ rknpu                  <span class="ok">98304  0</span>
     <article class="image-card">
       <div class="image-card-head">
         <h3>Desktop</h3>
-        <span class="size-tag">~770 MB</span>
+        <span class="size-tag">~940 MB</span>
       </div>
       <ul>
         <li>KDE Plasma + SDDM</li>
         <li>HW video decode (Rockchip VA-API)</li>
-        <li>RK3588 NPU stack baked in</li>
+        <li>Working NPU inference (~110 fps)</li>
         <li>Brave browser preinstalled</li>
         <li>Auto-launching setup wizard</li>
       </ul>
