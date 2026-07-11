@@ -8,8 +8,8 @@ Currently there is no off-the-shelf 26.04 image for this board. [Joshua Riek's `
 
 Skip everything below and grab a prebuilt 26.04 image from the [latest release page](https://github.com/mack42/OrangePi5Pro/releases/latest):
 
-- **`*_desktop.img.xz`** (~770 MB) — KDE Plasma + SDDM + HW video decode + `orangepi-setup` auto-prompt baked in. The "just works" option.
-- **`*_minimal.img.xz`** (~300 MB) — CLI only, headless / server use. Run `orangepi-setup` post-boot for Plasma + setup.
+- **`*_desktop.img.xz`** (~940 MB) — KDE Plasma + SDDM + HW video decode + `orangepi-setup` auto-prompt baked in. The "just works" option.
+- **`*_minimal.img.xz`** (~440 MB) — CLI only, headless / server use. Run `orangepi-setup` post-boot for Plasma + setup.
 
 Flash with [balenaEtcher](https://etcher.balena.io/) on any OS, or `xz -dc *.img.xz | sudo dd of=/dev/sdX bs=4M status=progress` on Linux/macOS — see [Step 2](#step-2--flash-and-boot-the-2404-image) below for full per-OS commands and the SHA-256 verify step. Continue reading only if you want to rebuild it yourself or understand why it's needed.
 
@@ -22,7 +22,7 @@ Flash with [balenaEtcher](https://etcher.balena.io/) on any OS, or `xz -dc *.img
 | `apply-uutils-shim.sh` | Patches Armbian's framework with: (1) deploy uutils→qemu-shim, (2) restore before image creation, (3) rk3588 boot-delay (`rootwait rootdelay=10`), (4) rewrite hardcoded `qemu-user-static` package name to `qemu-user-binfmt` for Ubuntu 26.04 hosts. Idempotent. Called automatically by `02-build-resolute.sh`. |
 | `customize-image.sh` | Runs inside the chroot during a `--desktop` build. Installs `kubuntu-desktop`, builds `librockchip-mpp` + `woodyst/rockchip-vaapi` + `libva-utils` from source, replaces the Armbian motd header with Orange Pi 5 Pro branding, drops a setup-reminder motd, installs the kdialog wizard autostart entry, and sources `customize-image-npu.sh` for the NPU stack. Copied into `framework/userpatches/` by `02-build-resolute.sh --desktop`. |
 | `customize-image-minimal.sh` | Minimal-flavor counterpart. Clones the repo, symlinks `orangepi-setup`, replaces the Armbian motd header with Orange Pi 5 Pro branding, drops the setup-reminder motd, and sources `customize-image-npu.sh`. Copied into `framework/userpatches/` by `02-build-resolute.sh` (no flag). |
-| `customize-image-npu.sh` | Sourced by both customize scripts inside the chroot. Builds the `w568w/rknpu-module` DKMS package (with the fixes in `npu-patches/` for dma-buf import, the ioctl result-clobber, `RKNPU_GET_VOLT` NULL-deref, and core bus-clock wiring), downloads `librknnrt.so` 2.3.2 + `rknn_server`, compiles and installs an OPi-5-Pro DT overlay (single-IOMMU, core-0), ships udev rules that expose `/dev/rknpu` + `/dev/dma_heap` to the `render` group, and installs `orangepi-npu-benchmark` + a MobileNet sample model. Result: **real model inference works out of the box** (~110 inferences/s, non-root). |
+| `customize-image-npu.sh` | Sourced by both customize scripts inside the chroot. Builds the `w568w/rknpu-module` DKMS package (with the fixes in `npu-patches/` for dma-buf import, the ioctl result-clobber, `RKNPU_GET_VOLT` NULL-deref, core bus-clock wiring, and **DVFS** — a reworked `rknpu_devfreq.c` + vendored `devfreq-governor.h` so the NPU scales off its 200 MHz default), downloads `librknnrt.so` 2.3.2 + `rknn_server`, compiles and installs an OPi-5-Pro DT overlay (single-IOMMU core-0, NPU OPP table + `pclk` hold so a clock change doesn't wedge the SoC), ships udev rules that expose `/dev/rknpu` + `/dev/dma_heap` to the `render` group, installs the `orangepi-npu-performance` service (pins **800 MHz @ 0.9 V**), `orangepi-npu-benchmark`, and a MobileNet sample model. Result: **real model inference works out of the box, non-root, at ~330 inferences/s (800 MHz — 3× the stock clock).** |
 | `03-setup.sh` | TTY post-boot helper. Six prompts: install Plasma / auto-start UI / migrate to NVMe / SPI bootloader / install HW video / fix HDMI overscan. Run as `orangepi-setup` from either image, or `./03-setup.sh` from a clone. Re-runnable. |
 | `03-setup-gui.sh` | KDE/kdialog wrapper around the same flow for the desktop image. Auto-launches once on first Plasma login (Plasma + HW video are baked in, so it's a 3-question wizard: autostart toggle, NVMe migration, HDMI overscan). Run as `orangepi-setup-gui` from the application launcher or terminal. |
 | `orangepi-setup-gui.desktop` | Plasma autostart entry. Shipped to `/etc/xdg/autostart/` on the desktop image; runs `orangepi-setup-gui` once on first KDE login if `~/.opi5pro-setup-done` is missing. |
@@ -165,11 +165,11 @@ sudo usermod -aG docker "$USER" && newgrp docker
 git clone https://github.com/mack42/OrangePi5Pro.git
 cd OrangePi5Pro
 
-# Minimal CLI image (~8-15 min, ~300 MB):
+# Minimal CLI image (~8-15 min, ~440 MB):
 ./02-build-resolute.sh
 
 # OR — KDE Plasma desktop image with HW video decode + auto-prompt baked in
-# (~30-45 min, ~770 MB, all dependencies handled by customize-image.sh):
+# (~30-45 min, ~940 MB, all dependencies handled by customize-image.sh):
 ./02-build-resolute.sh --desktop
 ```
 
