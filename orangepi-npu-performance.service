@@ -1,0 +1,30 @@
+[Unit]
+Description=Pin RK3588 NPU to its production OPP (voltage-coordinated via rknpu devfreq)
+After=systemd-modules-load.service
+# The rknpu module is modalias-autoloaded; the ExecStart polls for its
+# debugfs freq node rather than ordering against a specific unit.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Production NPU frequency (Hz). 800 MHz @ 900 mV: ~3.5x the 200 MHz
+# boot default on MobileNet, 50 mV headroom under the vdd_npu_s0 rail
+# ceiling (950 mV), thermally trivial (<52 C). The rknpu devfreq path
+# (dev_pm_opp_set_rate) raises vdd_npu_s0 to the OPP voltage BEFORE the
+# clock on the way up; the value is clamped to the OPP table.
+Environment=NPU_FREQ_HZ=800000000
+# Safety net: the raise issues an SCMI CLK_NPU set_rate, which programs
+# the NPU PVTPLL through the NPU GRF over APB. If the NPU housekeeping
+# clocks (pclk_npu_root/grf, pvtm) are gated at that instant the EL3
+# access wedges the SoC. The rknpu driver holds them via its clock bulk
+# whenever the NPU is powered (the DT overlay lists them), and the
+# debugfs write powers the NPU on first -- so this is normally redundant.
+# We still force them on here as belt-and-suspenders so a raise can
+# never wedge, independent of runtime-PM timing.
+ExecStartPre=-/sbin/modprobe npu_pclk_hold
+ExecStart=/bin/sh -c 'for i in $(seq 1 30); do [ -w /sys/kernel/debug/rknpu/freq ] && break; sleep 1; done; \
+    echo "$NPU_FREQ_HZ" > /sys/kernel/debug/rknpu/freq && \
+    echo "NPU pinned to $(cat /sys/kernel/debug/rknpu/freq) Hz"'
+
+[Install]
+WantedBy=multi-user.target
