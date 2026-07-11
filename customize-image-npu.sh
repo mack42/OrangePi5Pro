@@ -110,7 +110,9 @@ install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/rknpu_devfreq.c \
 # only the header is missing. Verbatim copy of governor.h @ v6.18,
 # GPL-2.0, force-found ahead of the (absent) system one via the existing
 # -I$(src)/src/include/compat include path.
-install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/devfreq-governor.h \
+# -D: create the compat/linux/ dir if it doesn't exist yet — this install
+# runs before the mkdir further down (which sets it up for rk-dma-heap.h).
+install -D -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/devfreq-governor.h \
     /usr/src/rknpu-0.9.8/src/include/compat/linux/devfreq-governor.h
 
 # Patch rknpu_debugger.c: NULL-guard rknpu_dev->vdd in rknpu_volt_show —
