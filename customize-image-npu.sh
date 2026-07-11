@@ -86,6 +86,42 @@ rm -rf /tmp/rknpu-module
 install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/rknpu_mem.c \
     /usr/src/rknpu-0.9.8/src/rknpu_mem.c
 
+# Drop in our reworked rknpu_devfreq.c — enables real voltage-coordinated
+# DVFS on mainline. Changes vs upstream w568w (see npu-patches/ and the
+# upstream PR draft): (1) a single devm_pm_opp_set_config() that probes
+# the DT for rknpu-supply vs npu-supply and clk_npu vs scmi_clk so it
+# binds whichever this DT uses; (2) a built-in conservative RK3588 OPP
+# table registered via dev_pm_opp_add_dynamic when the DT carries no
+# operating-points-v2; (3) clk_bulk_prepare_enable() around
+# dev_pm_opp_set_rate() so the NPU housekeeping clocks (pclk_npu_root ->
+# pclk_npu_grf, pvtm) are running when TF-A's SCMI CLK_NPU set_rate
+# programs the NPU PVTPLL over APB — without them held the EL3 access
+# hard-wedges the whole SoC. The overlay below lists those pclks in the
+# NPU clock bulk so the driver holds them whenever the NPU is powered.
+install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/rknpu_devfreq.c \
+    /usr/src/rknpu-0.9.8/src/rknpu_devfreq.c
+
+# Vendor the devfreq governor header. rknpu_devfreq.c includes
+# <linux/devfreq-governor.h>, which is drivers/devfreq/governor.h in the
+# kernel tree and is NOT shipped in any distro kernel-headers package
+# (this is the sole reason the previous build had to stub DVFS out with
+# RKNPU_NO_DEVFREQ). Every symbol it declares (devfreq_add_governor,
+# devfreq_remove_governor, update_devfreq) IS exported by the kernel —
+# only the header is missing. Verbatim copy of governor.h @ v6.18,
+# GPL-2.0, force-found ahead of the (absent) system one via the existing
+# -I$(src)/src/include/compat include path.
+install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/devfreq-governor.h \
+    /usr/src/rknpu-0.9.8/src/include/compat/linux/devfreq-governor.h
+
+# Patch rknpu_debugger.c: NULL-guard rknpu_dev->vdd in rknpu_volt_show —
+# reading the debugfs `volt` node oopses the kernel when the OPP core
+# hasn't bound a regulator yet (same class of bug as the GET_VOLT ioctl
+# guard below).
+sed -i 's@^\(\s*\)current_volt = regulator_get_voltage(rknpu_dev->vdd);@\1current_volt = rknpu_dev->vdd ? regulator_get_voltage(rknpu_dev->vdd) : 0;@' \
+    /usr/src/rknpu-0.9.8/src/rknpu_debugger.c
+grep -q 'rknpu_dev->vdd ? regulator_get_voltage' /usr/src/rknpu-0.9.8/src/rknpu_debugger.c \
+    || { echo "ERROR: rknpu_volt_show NULL-guard patch did not apply" >&2; exit 1; }
+
 # Patch rknpu_gem.c: rknpu_gem_sync_ioctl uses rknpu_dev->fake_dev
 # unconditionally, but the field is only declared under
 # CONFIG_ROCKCHIP_RKNPU_DRM_GEM. In our DMA_HEAP build this function is
@@ -184,26 +220,13 @@ with open(path, "w") as f:
 print("patched rknpu_drv.c: CMA heap missing is now non-fatal at probe")
 PYPATCH
 
-# Patch Kbuild to (a) drop rknpu_devfreq.o and (b) define
-# RKNPU_NO_DEVFREQ globally. Armbian-current's kernel headers don't
-# install linux/devfreq-governor.h (CONFIG_PM_DEVFREQ may be enabled
-# but the governor header just isn't shipped in the headers package),
-# so rknpu_devfreq.c fails to compile. rknpu_devfreq.h has inline
-# stubs for all six devfreq functions, but they're only used when
-# RKNPU_NO_DEVFREQ is defined — otherwise the function prototypes
-# get declared, the .o is required, and linking fails with
-# "undefined symbol: rknpu_devfreq_*". So we drop the .o AND set the
-# define so stubs kick in everywhere callers reference these
-# functions. Loses DVFS (NPU runs at fixed clock rate); functional
-# inference is unaffected.
-sed -i 's@src/rknpu_devfreq\.o@@g' /usr/src/rknpu-0.9.8/Kbuild
-# Add src/rknpu_mem.o to the obj list (we just dropped its .c above).
-# Append after src/rknpu_iommu.o which is one of the existing entries.
+# Patch Kbuild: add src/rknpu_mem.o to the obj list (we dropped in its
+# .c above; upstream declares but never defines it). Append after
+# src/rknpu_iommu.o, an existing entry. rknpu_devfreq.o stays in the
+# build — DVFS is now enabled (we vendored the missing governor header
+# above), so we do NOT drop it and do NOT define RKNPU_NO_DEVFREQ.
 sed -i '0,/src\/rknpu_iommu\.o/{s@src/rknpu_iommu\.o@& src/rknpu_mem.o@}' \
     /usr/src/rknpu-0.9.8/Kbuild
-echo '# Force devfreq-stub path (no devfreq-governor.h in Armbian-current)' \
-    >> /usr/src/rknpu-0.9.8/Kbuild
-echo 'ccflags-y += -DRKNPU_NO_DEVFREQ' >> /usr/src/rknpu-0.9.8/Kbuild
 
 # Switch the driver from DRM_GEM mode to DMA_HEAP mode so it registers
 # as a misc device at /dev/rknpu — that's what librknnrt.so 2.3.2 opens.
@@ -326,6 +349,29 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
 &rknn_core_2 { status = "disabled"; };
 
 &{/} {
+    npu_opp: opp-table-npu {
+        compatible = "operating-points-v2";
+
+        /* RK3588 NPU OPPs. Voltages are rounded UP from Rockchip's BSP
+         * worst-bin values (300-600 MHz: 675 mV, 700: 700, 800: 750,
+         * 900: 800, 1000: 850 mV) for margin, and never below the
+         * 800 mV the rail already runs at. vdd_npu_s0's own DT
+         * constraints (550-950 mV) cap everything. dev_pm_opp_set_rate
+         * raises the regulator to opp-microvolt BEFORE the clock on the
+         * way up, so a high clock is never applied at low voltage.
+         * Validated on OPi 5 Pro: stable + correct (MobileNet class 156)
+         * at every step 300->1000 MHz; 1000 MHz @ 950 mV = 3.7x the
+         * 200 MHz throughput, <52 C. */
+        opp-300000000 { opp-hz = /bits/ 64 <300000000>; opp-microvolt = <800000 800000 950000>; };
+        opp-400000000 { opp-hz = /bits/ 64 <400000000>; opp-microvolt = <800000 800000 950000>; };
+        opp-500000000 { opp-hz = /bits/ 64 <500000000>; opp-microvolt = <825000 825000 950000>; };
+        opp-600000000 { opp-hz = /bits/ 64 <600000000>; opp-microvolt = <850000 850000 950000>; };
+        opp-700000000 { opp-hz = /bits/ 64 <700000000>; opp-microvolt = <875000 875000 950000>; };
+        opp-800000000 { opp-hz = /bits/ 64 <800000000>; opp-microvolt = <900000 900000 950000>; };
+        opp-900000000 { opp-hz = /bits/ 64 <900000000>; opp-microvolt = <925000 925000 950000>; };
+        opp-1000000000 { opp-hz = /bits/ 64 <1000000000>; opp-microvolt = <950000 950000 950000>; };
+    };
+
     rknpu: npu@fdab0000 {
         compatible = "rockchip,rk3588-rknpu", "rockchip,rknpu";
         reg = <0x0 0xfdab0000 0x0 0x9000>,
@@ -351,12 +397,44 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
          * RK3588 model. Listing the six bus clocks here makes power_on's
          * clk_bulk_prepare_enable() hold them on for the whole powered
          * window. clk_npu must stay first — the driver reports FREQ from
-         * clks[0]. */
+         * clks[0].
+         *
+         * The pclk/pvtm group (PCLK_NPU_ROOT, PCLK_NPU_GRF, the two PVTM
+         * clocks, HCLK_NPU_ROOT) is the DVFS-safety set. TF-A's SCMI
+         * CLK_NPU set_rate programs the NPU PVTPLL through the NPU GRF
+         * over APB; mainline gates pclk_npu_root as unused at boot, and
+         * an EL3 APB access through a gated pclk hard-wedges the whole
+         * SoC — so ANY NPU frequency change hangs the machine unless
+         * these are held (reproduced on OPi 5 Pro: raw set_rate to
+         * 300 MHz wedged it; holding these + set_rate is stable to
+         * 1000 MHz). Listing them here makes the driver's own
+         * clk_bulk_prepare_enable() in power_on hold them whenever the
+         * NPU is powered, which is exactly when a set_rate can occur. */
         clocks = <&scmi_clk SCMI_CLK_NPU>,
                  <&cru ACLK_NPU0>, <&cru ACLK_NPU1>, <&cru ACLK_NPU2>,
-                 <&cru HCLK_NPU0>, <&cru HCLK_NPU1>, <&cru HCLK_NPU2>;
+                 <&cru HCLK_NPU0>, <&cru HCLK_NPU1>, <&cru HCLK_NPU2>,
+                 <&cru PCLK_NPU_ROOT>, <&cru PCLK_NPU_GRF>,
+                 <&cru PCLK_NPU_PVTM>, <&cru CLK_NPU_PVTM>,
+                 <&cru CLK_CORE_NPU_PVTM>, <&cru HCLK_NPU_ROOT>;
         clock-names = "clk_npu", "aclk0", "aclk1", "aclk2",
-                      "hclk0", "hclk1", "hclk2";
+                      "hclk0", "hclk1", "hclk2",
+                      "pclk", "pclk_grf", "pclk_pvtm", "clk_pvtm",
+                      "clk_core_pvtm", "hclk_root";
+
+        /* The mainline rknn_core_0 node this overlay merges into carries
+         * assigned-clock-rates = <200000000> on SCMI_CLK_NPU, which
+         * of_clk_set_defaults applies on EVERY driver bind (of_clk.c
+         * only calls clk_set_rate when the rate is non-zero). Once the
+         * NPU has been raised above 200 MHz, a module reload would then
+         * issue an SCMI CLK_NPU rate change at bind time — before the
+         * driver has enabled its clock bulk — with pclk_npu_root/grf
+         * potentially gated, and hard-wedge the SoC. Overriding the rate
+         * to <0> makes of_clk_set_defaults skip the clock entirely: the
+         * NPU keeps whatever rate firmware left (cold boot: the TF-A
+         * default) until devfreq raises it through the safe, pclk-held
+         * path. */
+        assigned-clocks = <&scmi_clk SCMI_CLK_NPU>;
+        assigned-clock-rates = <0>;
 
         power-domains = <&power RK3588_PD_NPUTOP>,
                         <&power RK3588_PD_NPU1>,
@@ -375,7 +453,15 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
          * single iommu node with three reg banks — tracked as a follow-up. */
         iommus = <&rknn_mmu_0>;
 
+        operating-points-v2 = <&npu_opp>;
+
+        /* Same rail under both names. The driver's own vdd lookup and
+         * the RKNPU_GET_VOLT ioctl use "rknpu" (vendor-style); the OPP
+         * regulator binding in rknpu_devfreq.c probes both "rknpu" and
+         * "npu" and uses whichever resolves. Providing both aliases
+         * keeps every consumer happy. */
         npu-supply = <&vdd_npu_s0>;
+        rknpu-supply = <&vdd_npu_s0>;
         sram-supply = <&vdd_npu_s0>;
 
         status = "okay";
@@ -428,6 +514,52 @@ if [ -f /boot/armbianEnv.txt ]; then
     else
         echo 'user_overlays=rk3588-rknpu-opi5pro' >> /boot/armbianEnv.txt
     fi
+fi
+
+# --- 4b. NPU DVFS: pin the production frequency at boot ---
+# The rknpu devfreq path is voltage-coordinated (dev_pm_opp_set_rate
+# raises vdd_npu_s0 to the OPP voltage before the clock on the way up)
+# and the driver holds the NPU pclk/pvtm clocks while powered (overlay
+# above), so writing a target rate to the devfreq debugfs node is safe
+# and stays pinned (the rknpu_ondemand governor forwards whatever was
+# last requested; job submission never changes it). We pin 800 MHz @
+# 900 mV — ~3.5x the 200 MHz boot default on MobileNet, 50 mV under the
+# rail ceiling, thermally trivial. Bump NPU_FREQ_HZ to 1000000000 for
+# max throughput (validated stable @ 950 mV) if you don't mind running
+# at the regulator max.
+#
+# This is applied POST-boot (oneshot after multi-user), never at boot
+# before the driver is ready — a high clock must not be programmed while
+# the pclks are still gated during early boot.
+install -m 0644 /usr/local/share/OrangePi5Pro/orangepi-npu-performance.service \
+    /etc/systemd/system/orangepi-npu-performance.service
+systemctl enable orangepi-npu-performance.service || \
+    ln -sf /etc/systemd/system/orangepi-npu-performance.service \
+        /etc/systemd/system/multi-user.target.wants/orangepi-npu-performance.service
+
+# Optional belt-and-suspenders: a tiny module that holds the NPU pclk/
+# pvtm clocks enabled independently of the driver. With the overlay's
+# clock list the driver already holds them whenever the NPU is powered
+# (verified: set_rate to 1000 MHz is stable with this module absent), so
+# this is redundant — but the systemd unit modprobes it (non-fatal) as a
+# second guarantee that a frequency raise can never wedge the SoC due to
+# runtime-PM timing. Built as a plain out-of-tree module (not DKMS; it
+# has no ABI surface and is trivial to rebuild).
+kver_hold="$(ls /lib/modules 2>/dev/null | head -1)"
+if [ -n "$kver_hold" ] && [ -d "/lib/modules/$kver_hold/build" ]; then
+    holddir="$(mktemp -d)"
+    install -m 0644 /usr/local/share/OrangePi5Pro/npu-patches/npu_pclk_hold.c \
+        "$holddir/npu_pclk_hold.c"
+    printf 'obj-m := npu_pclk_hold.o\n' > "$holddir/Kbuild"
+    if make -C "/lib/modules/$kver_hold/build" M="$holddir" modules >/dev/null 2>&1; then
+        install -D -m 0644 "$holddir/npu_pclk_hold.ko" \
+            "/lib/modules/$kver_hold/updates/npu_pclk_hold.ko"
+        depmod -a "$kver_hold" || true
+        echo "npu_pclk_hold.ko installed for $kver_hold"
+    else
+        echo "WARN: npu_pclk_hold.ko build failed — driver still holds pclks via overlay; safety-net absent."
+    fi
+    rm -rf "$holddir"
 fi
 
 # --- 5. Blacklist rocket; auto-load rknpu ---
