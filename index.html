@@ -569,7 +569,7 @@ throughput    : <span class="ok">326.9 inferences/s</span>
       <ul>
         <li>KDE Plasma + SDDM</li>
         <li>HW video decode (Rockchip VA-API)</li>
-        <li>Working NPU inference (~330 fps @ 800 MHz)</li>
+        <li>Working NPU inference — all 3 cores (~558/s @ mask 0x7)</li>
         <li>Brave browser preinstalled</li>
         <li>Auto-launching setup wizard</li>
       </ul>
@@ -582,7 +582,7 @@ throughput    : <span class="ok">326.9 inferences/s</span>
       </div>
       <ul>
         <li>CLI only — headless / server</li>
-        <li>RK3588 NPU stack included</li>
+        <li>RK3588 NPU — all 3 cores</li>
         <li>orangepi-setup TTY wizard</li>
         <li>No GUI overhead</li>
         <li>Optional Plasma post-install</li>
@@ -610,7 +610,7 @@ throughput    : <span class="ok">326.9 inferences/s</span>
     <div class="feature">
       <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2a3 3 0 0 0-3 3v1a3 3 0 0 0-3 3v6a3 3 0 0 0 3 3v1a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-1a3 3 0 0 0 3-3V9a3 3 0 0 0-3-3V5a3 3 0 0 0-3-3z"/><line x1="9" y1="9" x2="15" y2="9"/><line x1="9" y1="15" x2="15" y2="15"/></svg></div>
       <h3>RK3588 NPU</h3>
-      <p>w568w/rknpu DKMS module + librknnrt 2.3.2 + custom DT overlay that replaces the mainline <code>rocket</code> nodes with vendor-style <code>rknpu</code>.</p>
+      <p>w568w/rknpu DKMS module + librknnrt 2.3.2 + custom DT overlay that replaces the mainline <code>rocket</code> nodes with a vendor-style <code>rknpu</code>. All three cores enabled via a 4-bank single-IOMMU node + a driver patch that pre-powers the per-core domains, so nothing runs on a bypassed MMU.</p>
     </div>
     <div class="feature">
       <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg></div>

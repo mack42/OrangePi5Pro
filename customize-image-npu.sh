@@ -173,18 +173,45 @@ with open(path, "w") as f:
 print("patched rknpu_drv.c: ioctl copy-back restricted to ACTION/SUBMIT")
 PYPATCH
 
-# Patch rknpu_drv.c: clamp the RK3588 config core_mask from 0x7 (all three
-# cores) to 0x1 (core 0 only). The DT overlay below binds the NPU to a single
-# IOMMU (rknn_mmu_0) — mainline rockchip-iommu's of_xlate is last-wins, so a
-# node listing three iommus leaves cores 1/2 on a *bypassed* MMU that emits
-# IOVAs as raw physical addresses (memory-corruption risk). Advertising only
-# core 0 keeps every path safe. Multi-core needs a single iommu node with
-# three reg banks — tracked as a follow-up. Only rk3588 uses 0x7, so this
-# sed is unambiguous.
+# Patch rknpu_drv.c / rknpu_job.c / include/rknpu_drv.h: apply the verified
+# multi-core NPU fix (npu-patches/rknpu-multicore.patch). It restores the
+# RK3588 config .core_mask to 0x7 (all three cores) behind a RUNTIME coverage
+# gate — rknpu_effective_core_mask() auto-limits to core 0 unless the bound
+# IOMMU's reg banks actually span the core1/core2 MMU banks (0xfdaca000 /
+# 0xfdada000), i.e. the 4-bank overlay below is active — and pre-powers the
+# NPU core power domains + core1/core2 bus clocks in rknpu_init() (module
+# load) so the shared mainline rk_iommu can program cores 1/2's MMU banks
+# without a synchronous external abort. The gate makes the driver SAFE under
+# ANY overlay: single-IOMMU DT -> core 0 only; 4-bank DT -> full 0x7.
+# Verified on OPi 5 Pro hardware (all three cores translate; MobileNet class
+# 156 at masks 0x1/0x2/0x4/0x7; ~558 inf/s at 0x7).
+#
+# The patch's first hunk rewrites the exact pre-image line
+#   .core_mask = 0x1, /* single-IOMMU DT: core0 only */
+# (the tree state it was generated against). Pristine w568w ships
+# `.core_mask = 0x7,`, so first normalize that line to the patch's expected
+# pre-image; the VERBATIM patch then rewrites it to
+#   .core_mask = 0x7, /* effective mask gated at probe by IOMMU coverage */
+# i.e. the shipped driver is multi-core, gated safe. Only rk3588 uses 0x7,
+# so the normalizing sed is unambiguous.
 sed -i 's@^\(\s*\)\.core_mask = 0x7,@\1.core_mask = 0x1, /* single-IOMMU DT: core0 only */@' \
     /usr/src/rknpu-0.9.8/src/rknpu_drv.c
 grep -q '\.core_mask = 0x1, /\* single-IOMMU' /usr/src/rknpu-0.9.8/src/rknpu_drv.c \
-    || { echo "ERROR: rk3588 core_mask clamp did not apply" >&2; exit 1; }
+    || { echo "ERROR: could not establish multi-core patch pre-image (rk3588 .core_mask line)" >&2; exit 1; }
+
+echo "=== applying multi-core NPU patch (npu-patches/rknpu-multicore.patch) ==="
+patch -p1 -d /usr/src/rknpu-0.9.8/src \
+    < /usr/local/share/OrangePi5Pro/npu-patches/rknpu-multicore.patch \
+    || { echo "ERROR: rknpu-multicore.patch FAILED to apply cleanly" >&2; exit 1; }
+
+# Assert the multi-core end-state landed — fail the build loudly otherwise.
+grep -q '\.core_mask = 0x7, /\* effective mask gated' /usr/src/rknpu-0.9.8/src/rknpu_drv.c \
+    || { echo "ERROR: multi-core .core_mask (0x7) missing after patch" >&2; exit 1; }
+grep -q 'rknpu_effective_core_mask' /usr/src/rknpu-0.9.8/src/rknpu_drv.c \
+    || { echo "ERROR: rknpu_effective_core_mask coverage gate missing after patch" >&2; exit 1; }
+grep -q 'rknpu_preinit_power_domains' /usr/src/rknpu-0.9.8/src/rknpu_drv.c \
+    || { echo "ERROR: rknpu_preinit_power_domains missing after patch" >&2; exit 1; }
+echo "multi-core NPU patch applied: .core_mask=0x7 gated by rknpu_effective_core_mask"
 
 # Patch rknpu_drv.c: probe() bails with -ENOMEM if rk_dma_heap_find
 # returns NULL for "rk-dma-heap-cma" (the BSP-only heap doesn't exist
@@ -328,9 +355,22 @@ mkdir -p /usr/src/orangepi5pro-overlays
 cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// DT overlay: replace mainline rocket (rknn_core_*) DT nodes with a
-// single vendor-compatible rknpu node so the w568w/rknpu-module driver
-// binds. Targets RK3588 (OPi 5 Pro). Adapted from Talos / Turing RK1.
+// DT overlay: multi-core RK3588 NPU for the w568w/rknpu-module driver.
+//
+// Same as rk3588-rknpu-opi5pro.dts (single vendor rknpu node replacing the
+// mainline rocket nodes) EXCEPT the IOMMU topology: instead of binding the
+// NPU to core0's MMU only, fold ALL FOUR NPU MMU banks into the single
+// rknn_mmu_0 iommu node.  Mainline rockchip-iommu programs every "reg" bank
+// of one node with the same page table (num_mmu = #reg entries), so all
+// three cores translate through one DMA domain — no core is left on a
+// bypassed MMU.  The driver detects the 4-bank node at probe and lifts its
+// core mask from 0x1 to 0x7 (see rknpu_effective_core_mask in rknpu_drv.c).
+//
+// Power/clock safety: rknpu_power_on() enables the full clock bulk (incl.
+// aclk/hclk for NPU1/NPU2) and syncs all three power domains via the genpd
+// virtual devices BEFORE its pm_runtime_get_sync(dev), which is what
+// resumes the iommu (device-link supplier) and programs the banks.  So the
+// core1/core2 MMU banks are only ever touched powered + clocked.
 
 /dts-v1/;
 /plugin/;
@@ -343,12 +383,37 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
     compatible = "rockchip,rk3588";
 };
 
-/* Disable mainline rocket per-core nodes. Keep rknn_mmu_0/1/2 enabled
- * so PM domain consumer accounting matches the vanilla DTB. The rknpu
- * node references them via iommus phandles. */
+/* Disable mainline rocket per-core nodes. */
 &rknn_core_0 { status = "disabled"; };
 &rknn_core_1 { status = "disabled"; };
 &rknn_core_2 { status = "disabled"; };
+
+/* Core1/core2 MMU banks are folded into rknn_mmu_0 below; their standalone
+ * nodes must be disabled or their probes would claim the same MMIO regions
+ * (devm_ioremap_resource -EBUSY) and last-wins of_xlate could rebind the
+ * NPU to a bank-1-only IOMMU. */
+&rknn_mmu_1 { status = "disabled"; };
+&rknn_mmu_2 { status = "disabled"; };
+
+/* One iommu device managing every NPU MMU bank:
+ *   fdab9000 / fdaba000 : core0 (two MMU instances, already both in the
+ *                         mainline node — proof multi-bank works)
+ *   fdaca000            : core1
+ *   fdada000            : core2
+ * Each bank's fault IRQ is the line it shares with its NPU core (110/111/
+ * 112); both rk_iommu and rknpu request them IRQF_SHARED.  The node keeps
+ * its own aclk/iface (ACLK_NPU0/HCLK_NPU0) and NPUTOP power domain: banks
+ * in NPU1/NPU2 domains are powered/clocked by the rknpu node's held clock
+ * bulk + genpd refs whenever they are programmed (see header comment). */
+&rknn_mmu_0 {
+    reg = <0x0 0xfdab9000 0x0 0x100>,
+          <0x0 0xfdaba000 0x0 0x100>,
+          <0x0 0xfdaca000 0x0 0x100>,
+          <0x0 0xfdada000 0x0 0x100>;
+    interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH 0>,
+                 <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
+                 <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
+};
 
 &{/} {
     npu_opp: opp-table-npu {
@@ -445,14 +510,10 @@ cat > /usr/src/orangepi5pro-overlays/rk3588-rknpu-opi5pro.dts <<'OVERLAY'
          * (rknpu_drv.c) using the strings "npu0"/"npu1"/"npu2". */
         power-domain-names = "npu0", "npu1", "npu2";
 
-        /* Single IOMMU only. Mainline rockchip-iommu's of_xlate is
-         * last-wins: a node listing three iommus binds the device to the
-         * LAST one (core2's MMU) and leaves cores 0/1 on a bypassed MMU
-         * that emits IOVAs as raw physical addresses — the NPU then reads
-         * garbage, jobs time out, and stray DMA can corrupt memory. Bind
-         * to core0's MMU only; the driver's core_mask is clamped to 0x1 to
-         * match (see rknpu_drv.c patch above). True multi-core needs a
-         * single iommu node with three reg banks — tracked as a follow-up. */
+        /* Single iommu phandle -> the 4-bank rknn_mmu_0 node above.
+         * of_xlate binds the NPU to that one iommu device; rk_iommu
+         * programs all four banks with the same page table, so cores
+         * 0/1/2 all translate through the same DMA domain. */
         iommus = <&rknn_mmu_0>;
 
         operating-points-v2 = <&npu_opp>;
