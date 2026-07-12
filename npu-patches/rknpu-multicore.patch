@@ -1,0 +1,348 @@
+diff -ruN rknpu-src.orig/include/rknpu_drv.h rknpu-src/include/rknpu_drv.h
+--- rknpu-src.orig/include/rknpu_drv.h	2026-07-11 23:36:08.096885101 +0000
++++ rknpu-src/include/rknpu_drv.h	2026-07-12 01:01:54.644160650 +0000
+@@ -128,6 +128,10 @@
+ 	struct mutex domain_lock;
+ 	struct rknpu_subcore_data subcore_datas[RKNPU_MAX_CORES];
+ 	const struct rknpu_config *config;
++	/* effective core mask: config->core_mask, clamped to core 0 when the
++	 * bound IOMMU does not cover the core1/core2 MMU banks (see
++	 * rknpu_effective_core_mask) */
++	__u32 core_mask;
+ 	void __iomem *bw_priority_base;
+ 	struct rknpu_fence_context *fence_ctx;
+ 	bool iommu_en;
+@@ -153,6 +157,11 @@
+ 	struct device *genpd_dev_npu1;
+ 	struct device *genpd_dev_npu2;
+ 	bool multiple_domains;
++	/* multi-core: genpd_dev_npu0/1/2 were pre-attached + pre-powered in
++	 * rknpu_init() and are borrowed here; the module (not this device
++	 * instance) owns their put+detach, so probe/remove must not detach
++	 * them (see rknpu_preinit_power_domains / rknpu_exit) */
++	bool genpd_borrowed;
+ 	atomic_t power_refcount;
+ 	atomic_t cmdline_power_refcount;
+ 	struct delayed_work power_off_work;
+diff -ruN rknpu-src.orig/rknpu_drv.c rknpu-src/rknpu_drv.c
+--- rknpu-src.orig/rknpu_drv.c	2026-07-11 23:36:08.097891068 +0000
++++ rknpu-src/rknpu_drv.c	2026-07-12 01:09:56.649517043 +0000
+@@ -194,7 +194,7 @@
+ 	.nbuf_phyaddr = 0,
+ 	.nbuf_size = 0,
+ 	.max_submit_number = (1 << 12) - 1,
+-	.core_mask = 0x1, /* single-IOMMU DT: core0 only */
++	.core_mask = 0x7, /* effective mask gated at probe by IOMMU coverage */
+ 	.amount_top = NULL,
+ 	.amount_core = NULL,
+ 	.state_init = NULL,
+@@ -1321,6 +1321,82 @@
+ 	return 0;
+ }
+ 
++/*
++ * Mainline rockchip-iommu binds a DMA master to exactly ONE iommu node
++ * (its of_xlate is last-wins).  On RK3588 the three NPU cores sit behind
++ * separate MMU banks; a core whose bank is NOT managed by the bound iommu
++ * node runs with its MMU in bypass and emits raw physical addresses as
++ * IOVAs — silent memory corruption, not just a fault.  Only allow cores
++ * 1/2 when the bound iommu node's "reg" actually covers their MMU banks
++ * (0xfdaca000 / 0xfdada000), i.e. the multi-core 4-bank DT overlay is
++ * active.  Under the single-IOMMU overlay this clamps to core 0, keeping
++ * the driver consistent with whichever overlay booted.
++ */
++#define RK3588_NPU_CORE1_MMU_BASE 0xfdaca000UL
++#define RK3588_NPU_CORE2_MMU_BASE 0xfdada000UL
++
++/* NPU core power domains pre-attached + pre-powered in rknpu_init(); borrowed
++ * by rknpu_probe(). See rknpu_preinit_power_domains(). */
++static struct device *rknpu_pinned_genpd[3];	/* [0]=npu0 [1]=npu1 [2]=npu2 */
++/* core1/core2 MMU bus clocks (ACLK/HCLK_NPU1/2) held ON alongside the
++ * domains: rk_iommu only ungates its own NPU0 aclk/iface, so without these
++ * the iommu's access to the core1/core2 MMU banks would hit gated bus
++ * clocks (bus hang / abort). */
++static struct clk *rknpu_pinned_clk[4];		/* aclk1 aclk2 hclk1 hclk2 */
++static bool rknpu_preinit_done;
++
++/*
++ * True iff the NPU's BOUND iommu node (of_xlate is last-wins, so the LAST
++ * "iommus" entry) has reg banks covering BOTH the core1 (0xfdaca000) and
++ * core2 (0xfdada000) MMU banks — i.e. the multi-core 4-bank overlay is
++ * active and it is safe to run cores 1/2 (their MMUs are attached, not
++ * bypassed).
++ */
++static bool rknpu_iommu_covers_cores12(struct device *dev)
++{
++	struct of_phandle_args args;
++	struct resource res;
++	bool has_core1 = false, has_core2 = false;
++	int count, i;
++
++	if (!of_device_is_compatible(dev->of_node, "rockchip,rk3588-rknpu"))
++		return false;
++
++	count = of_count_phandle_with_args(dev->of_node, "iommus",
++					   "#iommu-cells");
++	if (count <= 0)
++		return false;
++
++	if (of_parse_phandle_with_args(dev->of_node, "iommus", "#iommu-cells",
++				       count - 1, &args))
++		return false;
++
++	for (i = 0; of_address_to_resource(args.np, i, &res) == 0; i++) {
++		if (res.start == RK3588_NPU_CORE1_MMU_BASE)
++			has_core1 = true;
++		else if (res.start == RK3588_NPU_CORE2_MMU_BASE)
++			has_core2 = true;
++	}
++	of_node_put(args.np);
++
++	return has_core1 && has_core2;
++}
++
++static u32 rknpu_effective_core_mask(struct device *dev,
++				     const struct rknpu_config *config)
++{
++	if (config->core_mask <= RKNPU_CORE0_MASK)
++		return config->core_mask;
++
++	if (rknpu_iommu_covers_cores12(dev))
++		return config->core_mask;
++
++	LOG_DEV_INFO(
++		dev,
++		"bound IOMMU does not cover NPU core1/core2 MMU banks, limiting to core 0\n");
++	return RKNPU_CORE0_MASK;
++}
++
+ static int rknpu_get_invalid_core_mask(struct device *dev)
+ {
+ 	int ret = 0;
+@@ -1391,6 +1467,7 @@
+ 	}
+ 
+ 	rknpu_dev->config = config;
++	rknpu_dev->core_mask = rknpu_effective_core_mask(dev, config);
+ 	rknpu_dev->dev = dev;
+ 	dev_set_drvdata(dev, rknpu_dev);
+ 
+@@ -1547,16 +1624,45 @@
+ 
+ 	if (of_count_phandle_with_args(dev->of_node, "power-domains",
+ 				       "#power-domain-cells") > 1) {
+-		virt_dev = dev_pm_domain_attach_by_name(dev, "npu0");
+-		if (!IS_ERR(virt_dev))
+-			rknpu_dev->genpd_dev_npu0 = virt_dev;
+-		virt_dev = dev_pm_domain_attach_by_name(dev, "npu1");
+-		if (!IS_ERR(virt_dev))
+-			rknpu_dev->genpd_dev_npu1 = virt_dev;
+-		if (config->num_irqs > 2) {
+-			virt_dev = dev_pm_domain_attach_by_name(dev, "npu2");
++		/*
++		 * Multi-core IOMMU power fix (RK3588 4-bank single-node overlay).
++		 *
++		 * The shared mainline rk_iommu programs EVERY NPU MMU bank in
++		 * rk_iommu_enable(); it is a PM-runtime *supplier* of this NPU
++		 * device (device-link, DL_FLAG_PM_RUNTIME), so the driver core
++		 * resumes it in really_probe()'s pm_runtime_get_suppliers()
++		 * BEFORE rknpu_probe() ever runs. core1/core2 MMU banks live in
++		 * PD_NPU1/PD_NPU2; if the iommu programs them while those domains
++		 * are off, the APB access is a synchronous external abort. No
++		 * code in this probe can prevent that — the resume already
++		 * happened. So for the multi-core DT the core power domains are
++		 * pre-attached and powered in rknpu_init() (module load, before
++		 * platform_driver_register). Here we just borrow those handles.
++		 */
++		if (rknpu_preinit_done) {
++			rknpu_dev->genpd_dev_npu0 = rknpu_pinned_genpd[0];
++			rknpu_dev->genpd_dev_npu1 = rknpu_pinned_genpd[1];
++			rknpu_dev->genpd_dev_npu2 = rknpu_pinned_genpd[2];
++			rknpu_dev->genpd_borrowed = true;
++			LOG_DEV_INFO(
++				dev,
++				"using pre-powered NPU core domains (npu0=%s npu1=%s npu2=%s)\n",
++				rknpu_dev->genpd_dev_npu0 ? "ok" : "null",
++				rknpu_dev->genpd_dev_npu1 ? "ok" : "null",
++				rknpu_dev->genpd_dev_npu2 ? "ok" : "null");
++		} else {
++			virt_dev = dev_pm_domain_attach_by_name(dev, "npu0");
+ 			if (!IS_ERR(virt_dev))
+-				rknpu_dev->genpd_dev_npu2 = virt_dev;
++				rknpu_dev->genpd_dev_npu0 = virt_dev;
++			virt_dev = dev_pm_domain_attach_by_name(dev, "npu1");
++			if (!IS_ERR(virt_dev))
++				rknpu_dev->genpd_dev_npu1 = virt_dev;
++			if (config->num_irqs > 2) {
++				virt_dev = dev_pm_domain_attach_by_name(dev,
++									"npu2");
++				if (!IS_ERR(virt_dev))
++					rknpu_dev->genpd_dev_npu2 = virt_dev;
++			}
+ 		}
+ 		rknpu_dev->multiple_domains = true;
+ 	}
+@@ -1624,7 +1730,8 @@
+ 	rknpu_power_off(rknpu_dev);
+ 
+ err_detach_pm:
+-	if (rknpu_dev->multiple_domains) {
++	/* borrowed (pre-init) domains are detached by rknpu_exit, not here */
++	if (rknpu_dev->multiple_domains && !rknpu_dev->genpd_borrowed) {
+ 		if (rknpu_dev->genpd_dev_npu2)
+ 			dev_pm_domain_detach(rknpu_dev->genpd_dev_npu2, true);
+ 		if (rknpu_dev->genpd_dev_npu1)
+@@ -1703,7 +1810,8 @@
+ 		rknpu_power_off(rknpu_dev);
+ 	mutex_unlock(&rknpu_dev->power_lock);
+ 
+-	if (rknpu_dev->multiple_domains) {
++	/* borrowed (pre-init) domains are detached by rknpu_exit, not here */
++	if (rknpu_dev->multiple_domains && !rknpu_dev->genpd_borrowed) {
+ 		if (rknpu_dev->genpd_dev_npu0)
+ 			dev_pm_domain_detach(rknpu_dev->genpd_dev_npu0, true);
+ 		if (rknpu_dev->genpd_dev_npu1)
+@@ -1774,14 +1882,120 @@
+ 	},
+ };
+ 
++/*
++ * Multi-core NPU power-domain pre-attach (see the long comment in
++ * rknpu_probe). The single mainline rk_iommu that manages all NPU MMU banks
++ * is a PM-runtime device-link supplier of the NPU platform device, so the
++ * driver core resumes it (rk_iommu_enable → programs every bank) inside
++ * really_probe()'s pm_runtime_get_suppliers(), BEFORE rknpu_probe() runs.
++ * core1/core2 MMU banks are in PD_NPU1/PD_NPU2; touching them while off is a
++ * synchronous external abort. The only module-level hook that runs before
++ * that resume is module init, here — so pre-attach and power the three NPU
++ * core power domains before platform_driver_register(). rknpu_probe() then
++ * borrows these handles instead of re-attaching. Only done when the bound
++ * IOMMU actually spans core1/core2 banks (the 4-bank multi-core overlay);
++ * under the single-IOMMU overlay this is a no-op.
++ */
++static void rknpu_preinit_power_domains(void)
++{
++	static const char *const names[3] = { "npu0", "npu1", "npu2" };
++	struct device_node *np;
++	struct platform_device *pdev;
++	struct device *dev, *vd;
++	int i;
++
++	np = of_find_compatible_node(NULL, NULL, "rockchip,rk3588-rknpu");
++	if (!np)
++		return;
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return;
++	dev = &pdev->dev;
++
++	if (of_count_phandle_with_args(dev->of_node, "power-domains",
++				       "#power-domain-cells") < 3 ||
++	    !rknpu_iommu_covers_cores12(dev)) {
++		/* single-core / non-multi-core DT: nothing to pre-power */
++		platform_device_put(pdev);
++		return;
++	}
++
++	for (i = 0; i < 3; i++) {
++		int ret;
++
++		vd = dev_pm_domain_attach_by_name(dev, names[i]);
++		if (IS_ERR_OR_NULL(vd)) {
++			pr_info("rknpu: preinit attach %s -> %ld\n", names[i],
++				PTR_ERR(vd));
++			rknpu_pinned_genpd[i] = NULL;
++			continue;
++		}
++		rknpu_pinned_genpd[i] = vd;
++		ret = pm_runtime_get_sync(vd);
++		pr_info("rknpu: preinit power-on %s: get_sync=%d\n", names[i],
++			ret);
++	}
++
++	{
++		static const char *const clk_names[4] = { "aclk1", "aclk2",
++							  "hclk1", "hclk2" };
++		struct clk *c;
++
++		for (i = 0; i < 4; i++) {
++			c = clk_get(dev, clk_names[i]);
++			if (IS_ERR(c)) {
++				pr_info("rknpu: preinit clk_get %s -> %ld\n",
++					clk_names[i], PTR_ERR(c));
++				rknpu_pinned_clk[i] = NULL;
++				continue;
++			}
++			clk_prepare_enable(c);
++			rknpu_pinned_clk[i] = c;
++		}
++	}
++	rknpu_preinit_done = true;
++	pr_info("rknpu: pre-powered NPU core power domains before driver bind (npu0=%s npu1=%s npu2=%s)\n",
++		rknpu_pinned_genpd[0] ? "ok" : "null",
++		rknpu_pinned_genpd[1] ? "ok" : "null",
++		rknpu_pinned_genpd[2] ? "ok" : "null");
++
++	/* keep the device ref while pinned; released in rknpu_exit */
++}
++
++static void rknpu_preexit_power_domains(void)
++{
++	int i;
++
++	if (!rknpu_preinit_done)
++		return;
++	for (i = 3; i >= 0; i--) {
++		if (rknpu_pinned_clk[i]) {
++			clk_disable_unprepare(rknpu_pinned_clk[i]);
++			clk_put(rknpu_pinned_clk[i]);
++			rknpu_pinned_clk[i] = NULL;
++		}
++	}
++	for (i = 2; i >= 0; i--) {
++		if (rknpu_pinned_genpd[i]) {
++			pm_runtime_put_sync(rknpu_pinned_genpd[i]);
++			dev_pm_domain_detach(rknpu_pinned_genpd[i], true);
++			rknpu_pinned_genpd[i] = NULL;
++		}
++	}
++	rknpu_preinit_done = false;
++}
++
+ static int rknpu_init(void)
+ {
++	rknpu_preinit_power_domains();
+ 	return platform_driver_register(&rknpu_driver);
+ }
+ 
+ static void rknpu_exit(void)
+ {
+ 	platform_driver_unregister(&rknpu_driver);
++	rknpu_preexit_power_domains();
+ }
+ 
+ late_initcall(rknpu_init);
+diff -ruN rknpu-src.orig/rknpu_job.c rknpu-src/rknpu_job.c
+--- rknpu-src.orig/rknpu_job.c	2026-07-11 23:36:08.096269436 +0000
++++ rknpu-src/rknpu_job.c	2026-07-11 23:37:04.429365057 +0000
+@@ -520,6 +520,10 @@
+ 	int i = 0;
+ 
+ 	for (i = 1; i < core_num; i++) {
++		/* never auto-schedule onto a core outside the effective mask:
++		 * with the single-IOMMU DT such a core's MMU is bypassed */
++		if (!(rknpu_dev->core_mask & rknpu_core_mask(i)))
++			continue;
+ 		if (task_num > rknpu_dev->subcore_datas[i].task_num) {
+ 			core_index = i;
+ 			task_num = rknpu_dev->subcore_datas[i].task_num;
+@@ -786,7 +790,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	if (args->core_mask > rknpu_dev->config->core_mask) {
++	if (args->core_mask > rknpu_dev->core_mask) {
+ 		LOG_ERROR("invalid rknpu core mask: %#x", args->core_mask);
+ 		return -EINVAL;
+ 	}
